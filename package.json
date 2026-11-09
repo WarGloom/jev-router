@@ -1,29 +1,31 @@
 {
   "name": "jev-router",
   "version": "0.3.0",
-  "description": "Runs coding CLIs and routes each turn to the cheapest sufficient model using TypeSafe Jev",
+  "description": "Codex model and reasoning-effort routing through TypeSafe Jev",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gargpratyush/jev-router.git"
+    "url": "git+https://github.com/WarGloom/jev-router.git"
   },
-  "homepage": "https://github.com/gargpratyush/jev-router#readme",
-  "bugs": "https://github.com/gargpratyush/jev-router/issues",
+  "homepage": "https://github.com/WarGloom/jev-router#readme",
+  "bugs": "https://github.com/WarGloom/jev-router/issues",
   "bin": {
-    "jev-claude": "bin/jev-claude.mjs",
     "jev-codex": "bin/jev-codex.mjs",
     "jev-explain": "bin/jev-explain.mjs"
   },
   "scripts": {
     "test": "node --test \"test/**/*.test.mjs\"",
-    "prepublishOnly": "npm test"
+    "prepublishOnly": "npm test",
+    "catalog": "node scripts/generate-codex-catalog.mjs"
   },
   "files": [
     ".claude/skills",
     "bin",
     "skills",
     "src",
-    "README.md"
+    "README.md",
+    "models.json",
+    "scripts"
   ],
   "keywords": [
     "claude",
@@ -42,6 +44,6 @@
   },
   "license": "MIT",
   "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0"
+    "@typesafe-ai/sdk": "0.6.0"
   }
 }

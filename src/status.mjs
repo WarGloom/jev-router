@@ -1,16 +1,9 @@
-import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, lstatSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { STATE_DIR, ensureStateDir, readPrivateStateFile, writePrivateFile } from "./local-config.mjs";
 
-// One file per session rather than a shared map, so concurrent jev-claude sessions can never
-// clobber each other's status. Kept in the temp dir so the OS eventually cleans up.
-const DIR = join(tmpdir(), "jev-claude");
-
-// Status files hold prompt text and exact Jev exchanges, so only the owner may read them.
-// On Linux the temp dir is the shared /tmp; macOS and Windows temp dirs are already per-user,
-// where these modes are harmless (Windows ignores them).
-const DIR_MODE = 0o700;
-const FILE_MODE = 0o600;
+// One private file per session, with bounded history and stale-file cleanup.
+const DIR = STATE_DIR;
 
 // Files not updated for this long belong to finished sessions and are removed.
 export const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
@@ -24,9 +17,7 @@ export function writeStatus(sessionId, status) {
   try {
     ensureDir();
     const file = fileFor(sessionId);
-    writeFileSync(file, JSON.stringify(status), { mode: FILE_MODE });
-    // `mode` only applies on creation; tighten files written by earlier versions too.
-    chmodSync(file, FILE_MODE);
+    writePrivateFile(file, JSON.stringify(status));
     if (!pruned) {
       pruned = true;
       pruneStale();
@@ -46,17 +37,14 @@ export function writeDecision(sessionId, decision) {
 /** Latest routing decision for a session, or null if none has been made yet. */
 export function readStatus(sessionId) {
   try {
-    return JSON.parse(readFileSync(fileFor(sessionId), "utf8"));
+    return JSON.parse(readPrivateStateFile(fileFor(sessionId)));
   } catch {
     return null;
   }
 }
 
 function ensureDir() {
-  mkdirSync(DIR, { recursive: true, mode: DIR_MODE });
-  // Directories created by earlier versions were world-readable. chmod fails if another user
-  // owns the directory, in which case the write below fails too and status is skipped.
-  chmodSync(DIR, DIR_MODE);
+  ensureStateDir();
 }
 
 /** Delete status files untouched for `maxAgeMs`. Runs once per process on the first write. */
@@ -67,7 +55,8 @@ export function pruneStale(maxAgeMs = STALE_AFTER_MS, now = Date.now()) {
       if (!name.endsWith(".json")) continue;
       const file = join(DIR, name);
       try {
-        if (now - statSync(file).mtimeMs > maxAgeMs) {
+        const stat = lstatSync(file);
+        if (stat.isFile() && !stat.isSymbolicLink() && stat.uid === process.getuid() && now - stat.mtimeMs > maxAgeMs) {
           unlinkSync(file);
           removed++;
         }

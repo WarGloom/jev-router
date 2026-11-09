@@ -1,8 +1,8 @@
 import http from "node:http";
 import https from "node:https";
-import { createHash, randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { availableTiers, shouldUseExactModel } from "./config.mjs";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { availableTiers, shouldUseExactModel, THRESHOLDS } from "./config.mjs";
 import { askJev } from "./router.mjs";
 import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
@@ -12,51 +12,36 @@ const CHATGPT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const API_BASE_URL = "https://api.openai.com/v1";
 export const CODEX_AUTO_MODEL = "jev-router";
 const DEFAULT_MODELS = {
-  haiku: "gpt-5.6-luna",
-  sonnet: "gpt-5.6-terra",
-  opus: "gpt-5.6-sol",
-  fable: "gpt-6-astra",
+  haiku: "gpt-6-luna",
+  sonnet: "gpt-6.1-terra",
+  opus: "gpt-6.1-sol",
 };
-const MODEL_ENV = {
-  haiku: "JEV_CODEX_FAST_MODEL",
-  sonnet: "JEV_CODEX_BALANCED_MODEL",
-  opus: "JEV_CODEX_STRONG_MODEL",
-  fable: "JEV_CODEX_LONG_MODEL",
-};
+const fallbackModels = new Map(JSON.parse(readFileSync(new URL("../models.json", import.meta.url), "utf8")).models.map((model) => [model.slug, model]));
+export const codexModelOf = (tier) => DEFAULT_MODELS[tier];
+export const codexTierOf = (model) => Object.keys(DEFAULT_MODELS).find((tier) => DEFAULT_MODELS[tier] === model) ?? null;
+const allowedModel = (model) => model === CODEX_AUTO_MODEL || codexTierOf(model) !== null;
 
-export const codexModelOf = (tier) => process.env[MODEL_ENV[tier]] ?? DEFAULT_MODELS[tier];
-
-export function codexTierOf(model) {
-  const configured = Object.keys(DEFAULT_MODELS).find((tier) => codexModelOf(tier) === model);
-  if (configured) return configured;
-  if (/(?:astra|fable|long)/i.test(model ?? "")) return "fable";
-  if (/(?:sol|opus|strong|max|pro)/i.test(model ?? "")) return "opus";
-  if (/(?:luna|haiku|fast|mini|nano)/i.test(model ?? "")) return "haiku";
-  return /^gpt-/i.test(model ?? "") ? "sonnet" : null;
-}
-
-/** Exact GPT models in Codex's account catalog; configured ids are the cold-start fallback. */
+/** Exact configured models with live catalog metadata and bundled metadata as fallback. */
 export function codexModels(models = new Map()) {
-  const available = [...models.values()]
-    .filter((model) => model.slug !== CODEX_AUTO_MODEL && model.supported_in_api !== false)
-    .map((model) => ({
-      id: model.slug,
-      tier: codexTierOf(model.slug),
-      description: [
-        model.display_name,
-        model.description,
-        model.context_window && `${model.context_window} context tokens`,
-      ].filter(Boolean).join("; "),
-    }))
-    .filter((model) => model.tier);
-  return available.length
-    ? available
-    : Object.keys(DEFAULT_MODELS).map((tier) => ({
-        id: codexModelOf(tier),
-        tier,
-        description: codexModelOf(tier),
-      }));
+  return Object.keys(DEFAULT_MODELS).map((tier) => {
+    const id = codexModelOf(tier);
+    const fallback = fallbackModels.get(id);
+    const live = models.get(id);
+    const model = live ?? fallback;
+    const effortInfo = live?.supported_reasoning_levels?.length ? live : fallback;
+    return {
+      id,
+      tier,
+      description: [model?.display_name, model?.description, model?.context_window && `${model.context_window} context tokens`].filter(Boolean).join("; ") || id,
+      efforts: effortInfo?.supported_reasoning_levels ?? [],
+      defaultEffort: effortInfo?.default_reasoning_level,
+    };
+  });
 }
+
+const supportsEffort = (model, effort) => model?.efforts.some((item) => item.effort === effort);
+const compatibleEffort = (model, preferred) =>
+  supportsEffort(model, preferred) ? preferred : model?.defaultEffort;
 
 const modelForTier = (models, tier) =>
   models.find((model) => model.tier === tier)?.id ?? codexModelOf(tier);
@@ -102,9 +87,9 @@ export function codexConversationKey(body) {
 }
 
 export function addJevModel(catalog) {
-  if (!Array.isArray(catalog?.models) || catalog.models.some((model) => model.slug === CODEX_AUTO_MODEL)) {
-    return catalog;
-  }
+  if (!Array.isArray(catalog?.models)) return catalog;
+  catalog.models = catalog.models.filter((model) => allowedModel(model.slug));
+  if (catalog.models.some((model) => model.slug === CODEX_AUTO_MODEL)) return catalog;
   const template =
     catalog.models.find((model) => model.slug === codexModelOf("sonnet")) ??
     catalog.models.find((model) => model.visibility === "list") ??
@@ -123,13 +108,13 @@ export function addJevModel(catalog) {
   return catalog;
 }
 
-export function applyCodexTier(body, tier, models = new Map(), model = codexModelOf(tier)) {
+export function applyCodexTier(body, tier, models = new Map(), model = codexModelOf(tier), effort) {
+  const info = codexModels(models).find((candidate) => candidate.id === model);
+  if (!info) throw new Error("Unsupported model");
+  const selectedEffort = compatibleEffort(info, effort ?? body.reasoning?.effort);
+  if (!supportsEffort(info, selectedEffort)) throw new Error("No supported reasoning effort");
   body.model = model;
-  const info = models.get(model);
-  const efforts = info?.supported_reasoning_levels?.map((level) => level.effort);
-  if (body.reasoning?.effort && efforts?.length && !efforts.includes(body.reasoning.effort)) {
-    body.reasoning.effort = info.default_reasoning_level;
-  }
+  body.reasoning = { ...body.reasoning, effort: selectedEffort };
   return body;
 }
 
@@ -140,12 +125,13 @@ export const upstreamFor = (
   apiBaseURL = API_BASE_URL,
 ) => /\/models(?:\?|$)/.test(path) || headers["chatgpt-account-id"] ? chatgptBaseURL : apiBaseURL;
 
-export function jevDecisionEvents({ tier, model = codexModelOf(tier), confidence, reason }) {
+export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, confidence, reason }) {
   const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
   const id = `jev-${randomUUID()}`;
+  const modelWithEffort = effort ? `${model} (${effort})` : model;
   const text = reason.startsWith("jev-unavailable")
-    ? `[Jev] unavailable; using ${model}. Add JEV_API_KEY=... to ~/.jev-router.env and restart jev-codex.`
-    : `[Jev] routed this turn to ${model} (${detail}).`;
+    ? `[Jev] unavailable; using ${modelWithEffort}. Check api_key_file in ~/.config/jev-router/config.json.`
+    : `[Jev] routed this turn to ${modelWithEffort} (${detail}).`;
   const item = {
     type: "message",
     role: "assistant",
@@ -169,44 +155,91 @@ export async function startCodexProxy({
   apiBaseURL = API_BASE_URL,
   route = askJev,
   statusId = "",
+  effortOverride = null,
 } = {}) {
+  const token = randomBytes(32).toString("hex");
+  const expectedToken = Buffer.from(token);
   const states = new Map();
   const models = new Map();
 
   const server = http.createServer((req, res) => {
+    const supplied = req.headers["x-jev-session"];
+    const suppliedToken = typeof supplied === "string" ? Buffer.from(supplied) : Buffer.alloc(0);
+    if (req.headers.origin !== undefined || suppliedToken.length !== expectedToken.length ||
+        !timingSafeEqual(suppliedToken, expectedToken)) {
+      res.writeHead(403).end();
+      req.resume();
+      return;
+    }
+    const maxBody = 32 * 1024 * 1024;
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let size = 0;
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > maxBody) {
+        tooLarge = true;
+        chunks.length = 0;
+        res.writeHead(413).end();
+        req.removeAllListeners("data");
+        req.resume();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", async () => {
+      if (tooLarge) return;
       let out = Buffer.concat(chunks);
       let routing;
-      if (req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "")) {
+      const isResponse = req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "");
+      let body;
+      if (out.length) {
         try {
-          const body = JSON.parse(out.toString());
-          if (process.env.JEV_DUMP) {
-            writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
+          body = JSON.parse(out.toString());
+        } catch {
+          res.writeHead(400).end();
+          return;
+        }
+        if (body?.model !== undefined && !allowedModel(body.model)) {
+          res.writeHead(403, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "Model is not allowed", type: "model_forbidden" } }));
+          return;
+        }
+      }
+      if (isResponse) {
+        try {
+          if (!body || typeof body !== "object" || Array.isArray(body)) {
+            res.writeHead(400).end();
+            return;
           }
           if (body.model === CODEX_AUTO_MODEL) {
             const key = codexConversationKey(body);
-            const candidates = codexModels(models).filter((model) =>
-              availableTiers().includes(model.tier),
+            const candidates = codexModels(models).filter((candidate) =>
+              availableTiers().includes(candidate.tier) && (!effortOverride || supportsEffort(candidate, effortOverride)),
             );
-            const available = [...new Set(candidates.map((model) => model.tier))];
-            const currentModel = states.get(key)?.model ?? modelForTier(candidates, "opus");
-            const current = codexTierOf(currentModel) ?? "opus";
+            if (!candidates.length) throw new Error("Unsupported reasoning effort override");
+            const available = candidates.map((candidate) => candidate.tier);
+            const previous = states.get(key);
+            const currentInfo = candidates.find((candidate) => candidate.id === previous?.model) ??
+              candidates.find((candidate) => candidate.tier === "opus") ?? candidates.at(-1);
+            const currentModel = currentInfo.id;
+            const current = currentInfo.tier;
+            const currentEffort = effortOverride ?? compatibleEffort(currentInfo, previous?.effort ?? body.reasoning?.effort);
             const prompt = codexNewTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
             let tier = current;
             let model = currentModel;
+            let effort = currentEffort;
             if (prompt && !explaining) {
               const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models: candidates });
+              const jev = await route({ prompt, current: currentModel, currentEffort, contextTokens, models: candidates, effortOverride });
               const chosen = candidates.find((candidate) => candidate.id === jev?.choice);
               const decision = decide({
                 prompt,
                 jev: jev && { ...jev, choice: chosen?.tier },
                 current,
                 available,
-                contextTokens,
+                contextTokens: previous ? contextTokens : 0,
               });
               tier = decision.tier;
               model =
@@ -215,11 +248,17 @@ export async function startCodexProxy({
                   : tier === current
                     ? currentModel
                     : modelForTier(candidates, tier);
-              states.set(key, { tier, model });
+              const selected = candidates.find((candidate) => candidate.id === model);
+              effort = effortOverride ?? compatibleEffort(selected, currentEffort);
+              if (!effortOverride && decision.reason.startsWith("jev") && model === chosen?.id &&
+                  Number.isFinite(jev.confidence) && jev.confidence >= THRESHOLDS.minConfidence &&
+                  supportsEffort(selected, jev.effort)) effort = jev.effort;
+              states.set(key, { tier, model, effort });
               routing = {
                 prompt,
                 tier,
                 model,
+                effort,
                 confidence: jev?.confidence ?? null,
                 metrics: jev?.metrics ?? null,
                 reason: decision.reason,
@@ -229,15 +268,24 @@ export async function startCodexProxy({
               writeDecision(statusId, routing);
               debug(`${key} ${current} -> ${tier} (${decision.reason}) | ${prompt.slice(0, 60)}`);
             }
-            applyCodexTier(body, tier, models, model);
+            applyCodexTier(body, tier, models, model, effort);
           } else {
+            const info = codexModels(models).find((candidate) => candidate.id === body.model);
+            const requestedEffort = effortOverride ?? body.reasoning?.effort;
+            if (!info || (requestedEffort && !supportsEffort(info, requestedEffort))) {
+              res.writeHead(400).end();
+              return;
+            }
+            if (effortOverride) body.reasoning = { ...body.reasoning, effort: effortOverride };
             const prompt = codexNewTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
             if (prompt && !explaining) writeStatus(statusId, { manual: true, at: Date.now() });
           }
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
-          debug(`codex passthrough, could not process body: ${err.message}`);
+          debug(`codex could not process body: ${err.message}`);
+          res.writeHead(400).end();
+          return;
         }
       }
 
@@ -246,6 +294,7 @@ export async function startCodexProxy({
       const transport = target.protocol === "http:" ? http : https;
       const headers = { ...req.headers, host: target.host };
       delete headers["content-length"];
+      delete headers["x-jev-session"];
       const upstream = transport.request(
         {
           hostname: target.hostname,
@@ -319,5 +368,5 @@ export async function startCodexProxy({
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { port: server.address().port, close: () => server.close() };
+  return { port: server.address().port, token, close: () => server.close() };
 }

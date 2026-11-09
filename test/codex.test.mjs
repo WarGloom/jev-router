@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -24,7 +24,7 @@ test("Codex uses a temporary authenticated Jev provider", () => {
   assert(args.includes('model_provider="jev"'));
   assert(args.includes("model_providers.jev.requires_openai_auth=true"));
   assert.deepEqual(args.slice(-2), ["--sandbox", "read-only"]);
-  assert.equal(codexArgs("http://127.0.0.1:1234", ["--model", "gpt-5.6-sol"]).filter((a) => a === "--model").length, 1);
+  assert.equal(codexArgs("http://127.0.0.1:1234", ["--model", "gpt-6.1-sol"]).filter((a) => a === "--model").length, 1);
 });
 
 test("installs the bundled explanation skill for Codex", (t) => {
@@ -77,8 +77,8 @@ test("keeps sub-agent routing state separate", () => {
 test("adds Jev Router to the native model catalog", () => {
   const catalog = addJevModel({
     models: [{
-      slug: "gpt-5.6-terra",
-      display_name: "GPT-5.6-Terra",
+      slug: "gpt-6.1-terra",
+      display_name: "GPT-6.1-Terra",
       visibility: "list",
       supported_in_api: true,
       priority: 2,
@@ -86,7 +86,7 @@ test("adds Jev Router to the native model catalog", () => {
   });
   assert.equal(catalog.models[0].slug, "jev-router");
   assert.equal(catalog.models[0].display_name, "Jev Router");
-  assert.equal(catalog.models[1].slug, "gpt-5.6-terra");
+  assert.equal(catalog.models[1].slug, "gpt-6.1-terra");
 });
 
 test("routes subscription auth to ChatGPT and API keys to the public API", () => {
@@ -101,22 +101,23 @@ test("routes subscription auth to ChatGPT and API keys to the public API", () =>
 test("maps tiers and clamps unsupported reasoning effort", () => {
   const body = { model: "jev-router", reasoning: { effort: "max" } };
   const models = new Map([[
-    "gpt-5.6-luna",
+    "gpt-6-luna",
     { default_reasoning_level: "medium", supported_reasoning_levels: [{ effort: "medium" }] },
   ]]);
   applyCodexTier(body, "haiku", models);
-  assert.equal(body.model, "gpt-5.6-luna");
+  assert.equal(body.model, "gpt-6-luna");
   assert.equal(body.reasoning.effort, "medium");
 });
 
 test("sends exact available GPT models to Jev", () => {
   const models = new Map([
-    ["gpt-5.6-terra", { slug: "gpt-5.6-terra", display_name: "GPT-5.6-Terra" }],
-    ["gpt-5.6-sol", { slug: "gpt-5.6-sol", display_name: "GPT-5.6-Sol" }],
+    ["gpt-6.1-terra", { slug: "gpt-6.1-terra", display_name: "GPT-6.1-Terra" }],
+    ["gpt-6.1-sol", { slug: "gpt-6.1-sol", display_name: "GPT-6.1-Sol" }],
   ]);
   assert.deepEqual(codexModels(models).map(({ id, tier }) => ({ id, tier })), [
-    { id: "gpt-5.6-terra", tier: "sonnet" },
-    { id: "gpt-5.6-sol", tier: "opus" },
+    { id: "gpt-6-luna", tier: "haiku" },
+    { id: "gpt-6.1-terra", tier: "sonnet" },
+    { id: "gpt-6.1-sol", tier: "opus" },
   ]);
 });
 
@@ -126,7 +127,7 @@ test("surfaces routing as a native commentary event", () => {
   assert.match(events, /response\.output_text\.delta/);
   assert.match(events, /response\.output_item\.done/);
   assert.match(events, /"phase":"commentary"/);
-  assert.match(events, /\[Jev\] routed this turn to gpt-5\.6-sol/);
+  assert.match(events, /\[Jev\] routed this turn to gpt-6\.1-sol/);
   assert.match(events, /confidence 0\.91/);
 
   const unavailable = jevDecisionEvents({
@@ -134,8 +135,8 @@ test("surfaces routing as a native commentary event", () => {
     confidence: null,
     reason: "jev-unavailable/no-change",
   });
-  assert.match(unavailable, /JEV_API_KEY=\.\.\. to ~\/\.jev-router\.env/);
-  assert.match(unavailable, /using gpt-5\.6-terra/);
+  assert.match(unavailable, /api_key_file in ~\/\.config\/jev-router\/config\.json/);
+  assert.match(unavailable, /using gpt-6\.1-terra/);
 });
 
 test("proxy preserves Codex auth, picker, routing, and native decision output", async (t) => {
@@ -148,20 +149,21 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
         url: req.url,
         authorization: req.headers.authorization,
         account: req.headers["chatgpt-account-id"],
+        session: req.headers["x-jev-session"],
         body: chunks.length ? JSON.parse(Buffer.concat(chunks)) : null,
       });
       if (req.url.startsWith("/backend-api/codex/models")) {
         res.setHeader("content-type", "application/json");
         return res.end(JSON.stringify({
           models: [{
-            slug: "gpt-5.6-terra",
-            display_name: "GPT-5.6-Terra",
+            slug: "gpt-6.1-terra",
+            display_name: "GPT-6.1-Terra",
             visibility: "list",
             supported_in_api: true,
             priority: 2,
           }, {
-            slug: "gpt-5.6-sol",
-            display_name: "GPT-5.6-Sol",
+            slug: "gpt-6.1-sol",
+            display_name: "GPT-6.1-Sol",
             visibility: "list",
             supported_in_api: true,
             priority: 3,
@@ -179,17 +181,18 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
   const upstreamURL = `http://127.0.0.1:${upstream.address().port}`;
   const statusId = `codex-test-${process.pid}`;
   let routeCalls = 0;
-  const { port, close } = await startCodexProxy({
+  const { port, token, close } = await startCodexProxy({
     chatgptBaseURL: `${upstreamURL}/backend-api/codex`,
     apiBaseURL: `${upstreamURL}/v1`,
     route: async ({ models }) => {
       routeCalls++;
-      assert.deepEqual(models.map((model) => model.id), ["gpt-5.6-terra", "gpt-5.6-sol"]);
+      assert.deepEqual(models.map((model) => model.id), ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"]);
       return {
-        choice: "gpt-5.6-sol",
+        choice: "gpt-6.1-sol",
+        effort: "high",
         confidence: 0.91,
         request: { state: { request: "debug this race" } },
-        response: { answers: { model: { choice: "gpt-5.6-sol", confidence: 0.91 } } },
+        response: { answers: { model: { choice: "gpt-6.1-sol", confidence: 0.91 } } },
         metrics: {
           taskComplexity: 0.82,
           reasoningRequired: 0.91,
@@ -201,7 +204,7 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
     statusId,
   });
   t.after(close);
-  const headers = { authorization: "Bearer subscription-token", "chatgpt-account-id": "acct" };
+  const headers = { authorization: "Bearer subscription-token", "chatgpt-account-id": "acct", "x-jev-session": token };
 
   const catalog = await fetch(`http://127.0.0.1:${port}/models?client_version=1`, { headers }).then((r) => r.json());
   assert.equal(catalog.models[0].slug, "jev-router");
@@ -221,9 +224,12 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
 
   assert.equal(seen[0].authorization, "Bearer subscription-token");
   assert.equal(seen[0].account, "acct");
-  assert.equal(seen[1].body.model, "gpt-5.6-sol");
+  assert.equal(seen[0].session, undefined);
+  assert.equal(seen[1].session, undefined);
+  assert.equal(seen[1].body.model, "gpt-6.1-sol");
+  assert.equal(seen[1].body.reasoning.effort, "high");
   assert.equal(readStatus(statusId).tier, "opus");
-  assert.equal(readStatus(statusId).model, "gpt-5.6-sol");
+  assert.equal(readStatus(statusId).model, "gpt-6.1-sol");
   assert.equal(readStatus(statusId).prompt, "debug this race");
   assert.equal(readStatus(statusId).jev.request.state.request, "debug this race");
   assert.equal(readStatus(statusId).history.length, 1);
@@ -260,6 +266,157 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
     }),
   });
   assert.equal(routeCalls, 1);
-  assert.equal(seen[3].body.model, "gpt-5.6-sol");
+  assert.equal(seen[3].body.model, "gpt-6.1-sol");
+  assert.equal(seen[3].body.reasoning.effort, "high");
   assert.equal(readStatus(statusId).metrics.reasoningRequired, 0.91);
+});
+
+
+test("proxy rejects unauthenticated, browser, Astra and oversized requests", async (t) => {
+  const dumpDir = mkdtempSync(join(tmpdir(), "jev-no-dump-"));
+  const oldDump = process.env.JEV_DUMP;
+  process.env.JEV_DUMP = join(dumpDir, "body");
+  t.after(() => {
+    if (oldDump === undefined) delete process.env.JEV_DUMP;
+    else process.env.JEV_DUMP = oldDump;
+    rmSync(dumpDir, { recursive: true, force: true });
+  });
+  let forwarded = 0;
+  const upstream = http.createServer((req, res) => {
+    forwarded++;
+    req.resume();
+    req.on("end", () => res.end("ok"));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const base = `http://127.0.0.1:${upstream.address().port}`;
+  const { port, token, close } = await startCodexProxy({ apiBaseURL: base, chatgptBaseURL: base });
+  t.after(close);
+  const url = `http://127.0.0.1:${port}/responses`;
+  assert.equal((await fetch(url)).status, 403);
+  assert.equal((await fetch(url, { headers: { "x-jev-session": "wrong" } })).status, 403);
+  assert.equal((await fetch(url, { headers: { "x-jev-session": token, origin: "https://example.com" } })).status, 403);
+  const headers = { "x-jev-session": token, "content-type": "application/json" };
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "GPT-6-AStRa" }) })).status, 403);
+  assert.equal((await fetch(`http://127.0.0.1:${port}/chat/completions`, { method: "POST", headers, body: JSON.stringify({ model: "gpt-6-astra" }) })).status, 403);
+  assert.equal((await fetch(url, { method: "POST", headers, body: "{" })).status, 400);
+  assert.equal((await fetch(url, { method: "POST", headers, body: "x".repeat(32 * 1024 * 1024 + 1) })).status, 413);
+  assert.equal(forwarded, 0);
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-5.6-sol" }) })).status, 403);
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-6-luna", reasoning: { effort: "ultra" } }) })).status, 400);
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-6-luna", reasoning: { effort: "high" } }) })).status, 200);
+  assert.equal(forwarded, 1);
+  assert.deepEqual(readdirSync(dumpDir), []);
+});
+
+test("Astra is excluded from catalog and environment overrides", () => {
+  const old = process.env.JEV_CODEX_STRONG_MODEL;
+  try {
+    process.env.JEV_CODEX_STRONG_MODEL = "gPt-6-AsTrA";
+    const catalog = addJevModel({ models: [
+      { slug: "gpt-6-ASTRA", visibility: "list" },
+      { slug: "gpt-5.6-sol", visibility: "list" },
+      { slug: "gpt-6.1-terra", visibility: "list" },
+    ] });
+    assert.deepEqual(catalog.models.map((m) => m.slug), ["jev-router", "gpt-6.1-terra"]);
+    const candidates = codexModels(new Map([["gpt-6-astra", { slug: "gpt-6-astra" }]]));
+    assert.deepEqual(candidates.map((m) => m.id), ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"]);
+  } finally {
+    if (old === undefined) delete process.env.JEV_CODEX_STRONG_MODEL;
+    else process.env.JEV_CODEX_STRONG_MODEL = old;
+  }
+});
+
+
+test("effort override limits auto candidates and rejects incompatible manual requests", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const base = `http://127.0.0.1:${upstream.address().port}`;
+  let options;
+  const { port, token, close } = await startCodexProxy({
+    apiBaseURL: base, effortOverride: "ultra",
+    route: async (input) => { options = input; return { choice: "gpt-6.1-terra", effort: "ultra", confidence: 0.9 }; },
+  });
+  t.after(close);
+  const url = `http://127.0.0.1:${port}/responses`;
+  const headers = { "x-jev-session": token, "content-type": "application/json" };
+  const input = [{ type: "additional_tools" }, { role: "user", content: "make a change" }];
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "jev-router", input }) })).status, 200);
+  assert.deepEqual(options.models.map((model) => model.id), ["gpt-6.1-terra", "gpt-6.1-sol"]);
+  assert.equal(options.effortOverride, "ultra");
+  assert.equal(seen[0].reasoning.effort, "ultra");
+  assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "gpt-6-luna" }) })).status, 400);
+});
+
+
+test("policy fallback keeps compatible effort instead of rejected Jev effort", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  let count = 0;
+  const base = `http://127.0.0.1:${upstream.address().port}`;
+  const { port, token, close } = await startCodexProxy({
+    apiBaseURL: base,
+    route: async () => ({ choice: "gpt-6.1-terra", effort: "low", confidence: ++count === 1 ? 0.1 : 0.9 }),
+  });
+  t.after(close);
+  const url = `http://127.0.0.1:${port}/responses`;
+  const headers = { "x-jev-session": token, "content-type": "application/json" };
+  const request = (text) => ({ model: "jev-router", prompt_cache_key: "same", reasoning: { effort: "high" }, input: [
+    { type: "additional_tools" }, { role: "user", content: text },
+  ] });
+  for (const text of ["simple", "x".repeat(81000)]) {
+    assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify(request(text)) })).status, 200);
+  }
+  assert.deepEqual(seen.map((body) => [body.model, body.reasoning.effort]), [
+    ["gpt-6.1-sol", "high"], ["gpt-6.1-sol", "high"],
+  ]);
+});
+
+
+test("large first turn can downgrade before a routed cache exists", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const contexts = [];
+  let calls = 0;
+  const { port, token, close } = await startCodexProxy({
+    apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async ({ contextTokens }) => {
+      contexts.push(contextTokens);
+      calls++;
+      return { choice: calls === 2 ? "gpt-6.1-sol" : "gpt-6-luna", effort: "low", confidence: 0.92 };
+    },
+  });
+  t.after(close);
+  const headers = { "x-jev-session": token, "content-type": "application/json" };
+  const send = (key) => fetch(`http://127.0.0.1:${port}/responses`, {
+    method: "POST", headers, body: JSON.stringify({ model: "jev-router", prompt_cache_key: key,
+      input: [{ type: "additional_tools" }, { role: "user", content: "x".repeat(81000) }] }),
+  });
+  assert.equal((await send("fresh")).status, 200);
+  assert.equal(seen[0].model, "gpt-6-luna");
+  assert.equal(seen[0].reasoning.effort, "low");
+  assert(contexts[0] > 20000);
+  assert.equal((await send("cached")).status, 200);
+  assert.equal(seen[1].model, "gpt-6.1-sol");
+  assert.equal((await send("cached")).status, 200);
+  assert.equal(seen[2].model, "gpt-6.1-sol");
+  assert(contexts[2] > 20000);
 });

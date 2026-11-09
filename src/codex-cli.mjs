@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
-import { accessSync, constants, copyFileSync, mkdirSync } from "node:fs";
+import { accessSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CODEX_AUTO_MODEL, startCodexProxy } from "./codex-proxy.mjs";
+import { codexEnvironment, readJevApiKey, readLocalConfig } from "./local-config.mjs";
 
 const PROVIDER = "jev";
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -12,22 +13,32 @@ const EXPLAIN_SKILL = join(ROOT, "skills", "codex", "jev-explain", "SKILL.md");
 export function installCodexSkill(home = homedir()) {
   const target = join(home, ".agents", "skills", "jev-router-explain", "SKILL.md");
   mkdirSync(dirname(target), { recursive: true });
-  copyFileSync(EXPLAIN_SKILL, target);
+  if (existsSync(target)) {
+    const stat = lstatSync(target);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid()
+        || readFileSync(target, "utf8") !== readFileSync(EXPLAIN_SKILL, "utf8")) {
+      throw new Error("Existing explanation skill differs; preserving it");
+    }
+    return target;
+  }
+  copyFileSync(EXPLAIN_SKILL, target, constants.COPYFILE_EXCL);
   return target;
 }
 
 export function loadEnv() {
-  for (const file of [
-    join(process.cwd(), ".env"),
-    join(homedir(), ".jev-router.env"),
-    join(homedir(), ".jev-claude.env"),
-  ]) {
-    try {
-      process.loadEnvFile(file);
-    } catch {
-      // Missing or unreadable; values may still come from the real environment.
-    }
+  // Configuration names a key file; it never imports project dotenv variables.
+  return readLocalConfig();
+}
+
+export function explicitEffort(args) {
+  let effort = null;
+  for (let index = 0; index < args.length; index++) {
+    const value = ["-c", "--config"].includes(args[index]) ? args[index + 1]
+      : args[index].startsWith("--config=") ? args[index].slice(9) : null;
+    const match = value?.match(/^model_reasoning_effort\s*=\s*(?:"([a-z]+)"|'([a-z]+)'|([a-z]+))\s*$/);
+    if (match) effort = match[1] ?? match[2] ?? match[3];
   }
+  return effort;
 }
 
 export function resolveCodex() {
@@ -67,17 +78,15 @@ export const codexArgs = (baseURL, args) => [
   `model_providers.${PROVIDER}.requires_openai_auth=true`,
   "--config",
   `model_providers.${PROVIDER}.supports_websockets=false`,
+  "--config",
+  `model_providers.${PROVIDER}.env_http_headers.X-Jev-Session="JEV_ROUTER_SESSION_TOKEN"`,
+  "--config",
+  `model_catalog_json=${JSON.stringify(join(ROOT, "codex-model-catalog.json"))}`,
   ...args,
 ];
 
 // Loads configuration, starts the optional routing proxy, and launches the Codex CLI.
 export async function runCodex() {
-  loadEnv();
-  try {
-    installCodexSkill();
-  } catch (err) {
-    process.stderr.write(`[jev] could not install the Codex explanation skill: ${err.message}\n`);
-  }
   const command = resolveCodex();
   if (!command) {
     process.stderr.write(
@@ -90,25 +99,43 @@ export async function runCodex() {
   }
 
   let args = process.argv.slice(2);
+  const informational = args.length === 1 && ["--help", "-h", "help", "--version", "-V"].includes(args[0]);
+  for (let i = 0; i < args.length; i++) {
+    const value = ["-m", "--model"].includes(args[i]) ? args[i + 1]
+      : args[i].startsWith("--model=") ? args[i].slice(8)
+      : ["-c", "--config"].includes(args[i]) && /^model\s*=/.test(args[i + 1] ?? "") ? args[i + 1] : "";
+    if (/astra/i.test(value ?? "")) {
+      process.stderr.write("[jev] Astra is disabled in jev-codex.\n");
+      process.exitCode = 2;
+      return;
+    }
+  }
   let close = () => {};
   const statusId = `codex-${process.pid}`;
-  process.env.JEV_CODEX_STATUS_ID = statusId;
-  if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
-    const proxy = await startCodexProxy({ statusId });
+  let env = codexEnvironment("");
+  env.JEV_CODEX_STATUS_ID = statusId;
+  if (!informational) {
+    if (!existsSync(join(ROOT, "codex-model-catalog.json"))) {
+      process.stderr.write("[jev] Local Codex catalog is missing; run npm run catalog in the router checkout.\n");
+      process.exitCode = 1;
+      return;
+    }
+    try { loadEnv(); readJevApiKey(); } catch {
+      process.stderr.write("[jev] Cannot read the owner-only TypeSafe key file; check ~/.config/jev-router/config.json.\n");
+      process.exitCode = 1;
+      return;
+    }
+    const proxy = await startCodexProxy({ statusId, effortOverride: explicitEffort(args) });
     close = proxy.close;
+    env = { ...codexEnvironment(proxy.token), JEV_CODEX_STATUS_ID: statusId };
     args = codexArgs(`http://127.0.0.1:${proxy.port}`, args);
-  } else {
-    process.stderr.write(
-      "[jev] no JEV_API_KEY found - starting Codex without routing\n" +
-        `[jev] add JEV_API_KEY=... to ${join(homedir(), ".jev-router.env")} and restart jev-codex\n`,
-    );
   }
 
   const childArgs = [...command.prefix, ...args];
   const child = spawn(
     command.file,
     command.shell ? childArgs.map((arg) => (/\s/.test(arg) ? `"${arg}"` : arg)) : childArgs,
-    { stdio: "inherit", shell: command.shell, env: process.env },
+    { stdio: "inherit", shell: command.shell, env },
   );
   child.on("error", (err) => {
     close();

@@ -1,8 +1,8 @@
-import { appendFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { closeSync, constants, fchmodSync, fstatSync, openSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { STATE_DIR, ensureStateDir } from "./local-config.mjs";
 
-export const LOG_FILE = join(homedir(), ".jev-claude.log");
+export const LOG_FILE = join(STATE_DIR, "router.log");
 
 // Claude Code owns the terminal in interactive mode and redraws over anything we print, so
 // writing to stderr there corrupts its UI. Log to a file instead and leave stderr alone.
@@ -13,7 +13,14 @@ export function log(line) {
   const text = `[jev] ${line}\n`;
   if (!interactive) return void process.stderr.write(text);
   try {
-    appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}`);
+    ensureStateDir();
+    const fd = openSync(LOG_FILE, constants.O_CREAT | constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.uid !== process.getuid()) throw new Error("Unsafe Jev log file");
+      fchmodSync(fd, 0o600);
+      writeFileSync(fd, `${new Date().toISOString()} ${text}`);
+    } finally { closeSync(fd); }
   } catch {
     // A broken log file must never take down the session.
   }
