@@ -86,6 +86,11 @@ selection. Routing resumes for user input after a final reply or in a new conver
 This guard detects active-turn steering; a final reply does not establish that the
 user's entire task is complete.
 
+Only real user tasks trigger Jev routing. Injected `AGENTS.md` instruction blocks
+remain context. Codex title generation, automatic approval assessments and returning-user
+catch-up requests bypass Jev and retain the conversation's selected model. Their
+contents still reach Codex, but they do not publish new task-routing decisions.
+
 Routing sends the current user request and model metadata to TypeSafe. Set
 `share_previous_exchange` to `true` in the owner-only local configuration to also
 send the preceding user/assistant exchange for contextual follow-ups. It defaults
