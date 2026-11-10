@@ -1,3 +1,5 @@
+import { THRESHOLDS } from "./config.mjs";
+
 const WIDTH = 33;
 const row = (text = "") => `│ ${text.slice(0, WIDTH - 2).padEnd(WIDTH - 2)} │`;
 const metric = (value) => (Number.isFinite(value) ? value.toFixed(2) : "n/a");
@@ -57,6 +59,13 @@ export function formatExplanation(status) {
     ] : []),
     row(),
     row(`Model-choice confidence: ${status.confidence == null ? "n/a" : `${Math.round(status.confidence * 100)}%`}`),
+    ...wrapped("Meaning: ", "Jev confidence in its model recommendation among the offered models."),
+    row(`Policy threshold: ${Math.round(THRESHOLDS.minConfidence * 100)}%`),
+    ...wrapped("Policy use: ", Number.isFinite(status.confidence)
+      ? status.confidence < THRESHOLDS.minConfidence
+        ? "Below threshold; low-confidence safeguards apply."
+        : "Meets threshold; model recommendation is eligible."
+      : "No confidence score recorded."),
     row(`Decision: ${decision(status.reason)}`),
     `└${"─".repeat(WIDTH)}┘`,
   ].join("\n");

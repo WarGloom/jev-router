@@ -97,11 +97,12 @@ The native footer can show the routing sentinel and client effort setting. The
 injected commentary reports the actual forwarded pair:
 
 ```text
-[Jev] routed this turn to gpt-6-luna (low). Jev model recommendation: gpt-6-luna (confidence in recommendation: 93%). Policy: accepted Jev recommendation. Reasoning effort: model default.
+[Jev] routed this turn to gpt-6-luna (low). Jev recommended gpt-6-luna. Reasoning effort: model default.
 ```
 
-Confidence describes Jev's model recommendation, including when policy selects a
-different model. A separate effort confidence is shown when Jev selects reasoning.
+Routine notices explain the selected model, retained model, and uncertain fallback
+in plain language. Detailed explanations retain model-choice confidence, its meaning
+and the configured policy threshold so scores can be interpreted in context.
 
 Conversation length never vetoes a routing recommendation. At low confidence,
 a downgrade from a stronger model uses the balanced fallback without going below

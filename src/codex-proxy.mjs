@@ -166,25 +166,22 @@ export const upstreamFor = (
   apiBaseURL = API_BASE_URL,
 ) => /\/models(?:\?|$)/.test(path) || headers["chatgpt-account-id"] ? chatgptBaseURL : apiBaseURL;
 
-export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, confidence, reason, jev, reasoningDecision }) {
+export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, reason, jev, reasoningDecision }) {
   const recommended = jev?.response?.answers?.model?.choice;
-  const recommendation = `Jev model recommendation: ${recommended ?? "not recorded"}` +
-    (Number.isFinite(confidence) ? ` (confidence in recommendation: ${Math.round(confidence * 100)}%)` : "");
-  let policy = reason.includes("override") ? "explicit model override"
-    : reason.includes("low-confidence-fallback") ? "low-confidence fallback"
-    : reason.includes("low-confidence-capped") ? "low-confidence upgrade capped"
-    : "accepted Jev recommendation";
-  if (reason.includes("+unavailable")) policy += "; nearest available model";
-  if (reason.includes("/no-change")) policy += "; kept current model";
-  const reasoning = reasoningDecision?.source === "jev"
-    ? ` Reasoning effort selected by Jev${Number.isFinite(reasoningDecision.confidence)
-      ? ` (confidence in effort recommendation: ${Math.round(reasoningDecision.confidence * 100)}%)` : ""}.`
+  let explanation = reason.includes("override") ? "Using your requested model."
+    : reason.includes("low-confidence-fallback")
+      ? `Jev was uncertain${recommended ? ` about choosing ${recommended}` : " about the model choice"}; used the balanced fallback.`
+    : reason.includes("low-confidence-capped") ? "Jev was uncertain; policy limited the model upgrade."
+    : recommended ? `Jev recommended ${recommended}.` : "Jev selected this model.";
+  if (reason.includes("+unavailable")) explanation += " Used the nearest available model.";
+  if (reason.includes("/no-change")) explanation += " Kept the current model.";
+  const reasoning = reasoningDecision?.source === "jev" ? " Reasoning effort selected by Jev."
     : reasoningDecision?.source === "model-default" ? " Reasoning effort: model default." : "";
   const id = `jev-${randomUUID()}`;
   const modelWithEffort = effort ? `${model} (${effort})` : model;
   const text = reason.startsWith("jev-unavailable")
     ? `[Jev] unavailable; using ${modelWithEffort}. Check api_key_file in ~/.config/jev-router/config.json.`
-    : `[Jev] routed this turn to ${modelWithEffort}. ${recommendation}. Policy: ${policy}.${reasoning}`;
+    : `[Jev] routed this turn to ${modelWithEffort}. ${explanation}${reasoning}`;
   const item = {
     type: "message",
     role: "assistant",

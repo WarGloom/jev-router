@@ -176,7 +176,7 @@ test("surfaces routing as a native commentary event", () => {
   assert.match(events, /response\.output_item\.done/);
   assert.match(events, /"phase":"commentary"/);
   assert.match(events, /\[Jev\] routed this turn to gpt-6\.1-sol/);
-  assert.match(events, /confidence in recommendation: 91%/);
+  assert.doesNotMatch(events, /confidence|91%|0\.91/);
 
   const fallback = jevDecisionEvents({
     tier: "sonnet", effort: "low", confidence: 0.25,
@@ -185,9 +185,14 @@ test("surfaces routing as a native commentary event", () => {
     reasoningDecision: { source: "jev", confidence: 0.85 },
   });
   assert.match(fallback, /routed this turn to gpt-6\.1-terra \(low\)/);
-  assert.match(fallback, /Jev model recommendation: gpt-6-luna \(confidence in recommendation: 25%\)/);
-  assert.match(fallback, /Policy: low-confidence fallback; kept current model/);
-  assert.match(fallback, /confidence in effort recommendation: 85%/);
+  assert.match(fallback, /Jev was uncertain about choosing gpt-6-luna; used the balanced fallback/);
+  assert.match(fallback, /Kept the current model/);
+  assert.match(fallback, /Reasoning effort selected by Jev/);
+  assert.doesNotMatch(fallback, /confidence|25%|85%|no-change/);
+  const unchanged = jevDecisionEvents({ tier: "sonnet", effort: "medium", confidence: 0.35,
+    reason: "jev/no-change", jev: { response: { answers: { model: { choice: "gpt-6.1-terra" } } } } });
+  assert.match(unchanged, /Jev recommended gpt-6\.1-terra\. Kept the current model/);
+  assert.doesNotMatch(unchanged, /confidence|0\.35|35%|no-change/);
 
   const unavailable = jevDecisionEvents({
     tier: "sonnet",

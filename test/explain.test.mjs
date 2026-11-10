@@ -29,6 +29,8 @@ test("formats the last routing decision", () => {
   assert.match(output, /Selected model: SONNET/);
   assert.match(output, /Model-choice confidence: 94%/);
   assert.match(output, /Decision: Jev recommendation/);
+  assert.match(output, /Policy threshold: 30%/);
+  assert.match(output, /Meets threshold/);
 });
 
 test("reports the separate Jev reasoning decision after a model change", () => {
