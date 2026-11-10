@@ -185,6 +185,8 @@ export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, re
   if (reason.includes("+unavailable")) explanation += " Used the nearest available model.";
   if (reason.includes("/no-change")) explanation += " Kept the current model.";
   const reasoning = reasoningDecision?.source === "jev" ? " Reasoning effort selected by Jev."
+    : reasoningDecision?.source === "request" ? " Reasoning effort requested by client."
+    : reasoningDecision?.source === "cli" ? " Reasoning effort from CLI default."
     : reasoningDecision?.source === "model-default" ? " Reasoning effort: model default." : "";
   const id = `jev-${randomUUID()}`;
   const modelWithEffort = effort ? `${model} (${effort})` : model;
@@ -287,21 +289,31 @@ export async function startCodexProxy({
             res.writeHead(400).end();
             return;
           }
+          // Resolve the current UI/config effort before cached decisions, including tool loops.
+          const requestedEffort = body.reasoning?.effort ?? effortOverride;
+          const hasRequestedEffort = requestedEffort != null;
+          const unsupportedEffort = () => Object.assign(
+            new Error("Requested reasoning effort is unsupported for the selected model or current tool loop"),
+            { code: "unsupported_reasoning_effort" },
+          );
           if (body.model === CODEX_AUTO_MODEL) {
             const key = codexConversationKey(body);
             const candidates = codexModels(models).filter((candidate) =>
-              availableTiers().includes(candidate.tier) && (!effortOverride || supportsEffort(candidate, effortOverride)),
+              availableTiers().includes(candidate.tier) &&
+                (!hasRequestedEffort || supportsEffort(candidate, requestedEffort)),
             );
-            if (!candidates.length) throw new Error("Unsupported reasoning effort override");
+            if (!candidates.length) throw unsupportedEffort();
             const available = candidates.map((candidate) => candidate.tier);
             const previous = states.get(key);
             const currentInfo = candidates.find((candidate) => candidate.id === previous?.model) ??
               candidates.find((candidate) => candidate.tier === "opus") ?? candidates.at(-1);
             const currentModel = currentInfo.id;
             const current = currentInfo.tier;
-            const currentEffort = effortOverride ?? compatibleEffort(currentInfo, previous?.effort ?? body.reasoning?.effort);
+            const currentEffort = requestedEffort ?? compatibleEffort(currentInfo, previous?.effort);
             const prompt = codexNewTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
+            if (previous && (!prompt || explaining || codexIsSteering(body)) &&
+                !candidates.some((candidate) => candidate.id === previous.model)) throw unsupportedEffort();
             let tier = current;
             let model = currentModel;
             let effort = currentEffort;
@@ -309,7 +321,8 @@ export async function startCodexProxy({
               const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
               const previousExchange = includePreviousExchange ? codexPreviousExchange(body) : [];
               const jev = await route({ prompt, previousExchange, selection: "model",
-                current: currentModel, currentEffort, contextTokens, models: candidates, effortOverride, signal });
+                current: currentModel, currentEffort, contextTokens, models: candidates,
+                effortOverride: requestedEffort, signal });
               if (cancelled()) return;
               const chosen = candidates.find((candidate) => candidate.id === jev?.choice);
               const decision = decide({
@@ -328,11 +341,12 @@ export async function startCodexProxy({
               const selected = candidates.find((candidate) => candidate.id === model);
               // Model and reasoning are separate choices. Every new task gets an effort
               // decision for the final model, including when the model stays the same.
-              effort = effortOverride ?? (model === currentModel
+              effort = requestedEffort ?? (model === currentModel
                 ? compatibleEffort(selected, currentEffort)
                 : selected.defaultEffort);
-              let reasoningDecision = null;
-              if (!effortOverride && jev) {
+              let reasoningDecision = hasRequestedEffort
+                ? { effort, source: body.reasoning?.effort != null ? "request" : "cli" } : null;
+              if (!hasRequestedEffort && jev) {
                 effort = selected.defaultEffort;
                 try {
                   const effortAnswer = await route({
@@ -353,7 +367,6 @@ export async function startCodexProxy({
                 }
                 reasoningDecision ??= { effort, source: "model-default" };
               }
-              states.set(key, { tier, model, effort });
               routing = {
                 prompt,
                 tier,
@@ -370,14 +383,15 @@ export async function startCodexProxy({
               debug(`${key} ${current} -> ${tier} (${decision.reason}) | ${prompt.slice(0, 60)}`);
             }
             applyCodexTier(body, tier, models, model, effort);
+            states.set(key, { tier, model, effort });
           } else {
             const info = codexModels(models).find((candidate) => candidate.id === body.model);
-            const requestedEffort = effortOverride ?? body.reasoning?.effort;
-            if (!info || (requestedEffort && !supportsEffort(info, requestedEffort))) {
+            if (!info) {
               res.writeHead(400).end();
               return;
             }
-            if (effortOverride) body.reasoning = { ...body.reasoning, effort: effortOverride };
+            if (hasRequestedEffort && !supportsEffort(info, requestedEffort)) throw unsupportedEffort();
+            if (hasRequestedEffort) body.reasoning = { ...body.reasoning, effort: requestedEffort };
             const prompt = codexNewTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>") || /^\$jev-explain\b/i.test(prompt ?? "");
             if (prompt && !explaining) writeStatus(statusId, { manual: true, at: Date.now() });
@@ -386,7 +400,10 @@ export async function startCodexProxy({
         } catch (err) {
           if (cancelled()) return;
           debug(`codex could not process body: ${err.message}`);
-          res.writeHead(400).end();
+          if (err.code === "unsupported_reasoning_effort") {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: err.code, message: err.message } }));
+          } else res.writeHead(400).end();
           return;
         }
       }

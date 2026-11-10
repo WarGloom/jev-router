@@ -531,7 +531,7 @@ test("uncertain model fallback asks Jev for the final model's reasoning effort",
   t.after(close);
   const url = `http://127.0.0.1:${port}/responses`;
   const headers = { "x-jev-session": token, "content-type": "application/json" };
-  const request = (text) => ({ model: "jev-router", prompt_cache_key: "same", reasoning: { effort: "high" }, input: [
+  const request = (text) => ({ model: "jev-router", prompt_cache_key: "same", input: [
     { type: "additional_tools" }, { role: "user", content: text },
   ] });
   for (const text of ["simple", "x".repeat(81000)]) {
@@ -671,4 +671,102 @@ test("large first and subsequent turns can downgrade model and effort", async (t
   assert.equal(seen[2].reasoning.effort, "low");
   assert(contexts[2] > 20000);
   assert.deepEqual(routedEffortModels, ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-luna"]);
+});
+
+
+async function requestEffortFixture(t, { effortOverride = null, choice = "gpt-6.1-sol" } = {}) {
+  const seen = [];
+  const choices = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const proxy = await startCodexProxy({
+    effortOverride,
+    apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async (options) => {
+      choices.push(options);
+      return { choice, effort: "low", confidence: 0.95 };
+    },
+  });
+  t.after(proxy.close);
+  const send = (effort, { key = "main", continuation = false, model = "jev-router" } = {}) => fetch(
+    `http://127.0.0.1:${proxy.port}/responses`, {
+      method: "POST", headers: { "x-jev-session": proxy.token, "content-type": "application/json" },
+      body: JSON.stringify({ model, prompt_cache_key: key,
+        ...(effort !== undefined ? { reasoning: { effort, summary: "auto" } } : {}),
+        input: [{ type: "additional_tools" }, { role: "user", content: "Investigate the failing check" },
+          ...(continuation ? [{ type: "function_call_output", call_id: "one", output: "Continue" }] : [])],
+      }),
+    },
+  );
+  return { send, seen, choices };
+}
+
+test("request high effort is never lowered by an automatic Jev decision", async (t) => {
+  const f = await requestEffortFixture(t);
+  assert.equal((await f.send("high")).status, 200);
+  assert.equal(f.seen[0].reasoning.effort, "high");
+  assert.equal(f.seen[0].reasoning.summary, "auto");
+  assert.deepEqual(f.choices.map((call) => call.selection), ["model"]);
+  assert.equal(f.choices[0].effortOverride, "high");
+});
+
+test("request effort changes take effect during the same conversation and tool loop", async (t) => {
+  const f = await requestEffortFixture(t);
+  for (const effort of ["high", "max", "medium"]) {
+    assert.equal((await f.send(effort)).status, 200);
+  }
+  assert.equal((await f.send("xhigh", { continuation: true })).status, 200);
+  assert.equal((await f.send(undefined, { continuation: true })).status, 200);
+  assert.deepEqual(f.seen.map((body) => body.reasoning.effort), ["high", "max", "medium", "xhigh", "xhigh"]);
+  assert.equal(f.choices.length, 3, "tool continuations do not reroute");
+});
+
+test("each child request keeps its own explicit effort ahead of the CLI default", async (t) => {
+  const f = await requestEffortFixture(t, { effortOverride: "high" });
+  assert.equal((await f.send(undefined)).status, 200);
+  assert.equal((await f.send("xhigh", { key: "inherited-child" })).status, 200);
+  assert.equal((await f.send("medium", { key: "explicit-child" })).status, 200);
+  assert.equal((await f.send("low", { model: "gpt-6-luna", key: "manual-child" })).status, 200);
+  assert.equal((await f.send(undefined, { continuation: true })).status, 200);
+  assert.deepEqual(f.seen.map((body) => body.reasoning.effort), ["high", "xhigh", "medium", "low", "high"]);
+});
+
+test("unsupported request efforts fail clearly without an upstream request", async (t) => {
+  const f = await requestEffortFixture(t);
+  for (const [effort, model] of [["unknown", "jev-router"], ["", "jev-router"], ["ultra", "gpt-6-luna"]]) {
+    const response = await f.send(effort, { model });
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error.type, "unsupported_reasoning_effort");
+  }
+  assert.equal(f.seen.length, 0);
+  assert.equal(f.choices.length, 0);
+});
+
+test("request effort restricts automatic routing to models supporting it exactly", async (t) => {
+  const f = await requestEffortFixture(t);
+  assert.equal((await f.send("ultra")).status, 200);
+  assert.deepEqual(f.choices[0].models.map((model) => model.id), ["gpt-6.1-terra", "gpt-6.1-sol"]);
+  assert.equal(f.seen[0].reasoning.effort, "ultra");
+});
+
+test("an unsupported tool-loop effort change never silently switches the active model", async (t) => {
+  const f = await requestEffortFixture(t, { choice: "gpt-6-luna" });
+  assert.equal((await f.send("high")).status, 200);
+  const response = await f.send("ultra", { continuation: true });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.type, "unsupported_reasoning_effort");
+  assert.equal(f.seen.length, 1);
+  assert.equal(f.choices.length, 1);
+});
+
+
+test("routing commentary identifies the client's explicit reasoning effort", () => {
+  const events = jevDecisionEvents({ tier: "opus", effort: "high", reason: "jev",
+    reasoningDecision: { source: "request", effort: "high" } });
+  assert.match(events, /Reasoning effort requested by client/);
 });

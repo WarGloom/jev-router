@@ -1,12 +1,28 @@
 # Jev Router for Codex
 
-This fork routes each fresh Codex user turn to a supported model and reasoning
+This is a fork of [gargpratyush/jev-router](https://github.com/gargpratyush/jev-router),
+adapted for Codex. It routes each fresh Codex user turn to a supported model and reasoning
 effort using TypeSafe Jev. It launches the real Codex CLI and uses its existing
 authentication, tools, permissions and sessions.
 
 The maintained commands are `jev-codex` and `jev-explain`. The upstream Claude
 implementation remains in the source tree, but this fork does not install its
 launcher.
+
+## What this fork changes and why
+
+- Adds a Codex launcher and local proxy so routing uses the existing Codex CLI,
+  authentication, sessions, tools, and permissions.
+- Routes model and reasoning effort separately, while honoring explicit client
+  and CLI effort settings, so automatic selection does not override user choices.
+- Preserves the selected model during tool loops and active-turn steering, and
+  routes only user tasks, to avoid changing models mid-task or routing injected
+  instructions and protocol traffic.
+- Adds Codex-specific explanations and protects local credentials, routing state,
+  and proxy access so decisions can be inspected without exposing secrets.
+
+The original Claude implementation remains available in the source tree; this
+fork focuses its maintained commands and installation on Codex.
 
 ## Install from this fork
 
@@ -53,8 +69,12 @@ Leave `jev-router` selected in the native model picker for automatic routing.
 Jev first chooses a model using explicit capability criteria: Luna for simple
 self-contained or mechanical work, Terra for ordinary scoped engineering, and
 Sol for unknown-cause diagnosis, architecture, security, or concurrency. After
-policy resolves the final model, a separate Jev Choice selects one of that
-model's supported reasoning levels on every new user turn. Supported levels
+policy resolves the final model, the router preserves the client's requested
+reasoning effort exactly. This includes native picker choices, saved Codex settings
+when the client serializes them in the request, and explicit child-agent request
+effort. The wrapper does not read Codex's saved configuration itself.
+A separate Jev Choice selects
+reasoning effort only when neither the request nor CLI supplies it. Supported levels
 come from the Codex capability catalog:
 
 | Model | Supported efforts |
@@ -77,10 +97,25 @@ jev-codex exec "Fix the failing test"
 jev-codex -c 'model_reasoning_effort="high"'
 ```
 
-An explicit CLI effort setting restricts eligible models and pins the forwarded
-effort. Selecting a concrete allowed model manually pauses automatic model
-routing. Tool-loop continuations and steering messages received before a final
-assistant reply retain the selected model and effort without calling Jev again.
+Effort precedence is the current request's `reasoning.effort`, then an explicit
+CLI effort setting, then automatic selection when both are absent. The requested
+effort restricts eligible models to those that support it exactly; the router
+never substitutes a weaker level. A native picker change takes effect on the
+next request, including during the same conversation. High controls reasoning
+depth; model routing remains a separate choice. Low favors fast responses with
+lighter reasoning; Medium balances speed and depth; High adds depth for complex
+problems. The additional `xhigh`, `max`, and `ultra` levels are available only
+where the selected model's catalog lists them. Effort is passed to the selected
+model; it does not guarantee subagent delegation.
+
+Selecting a concrete allowed model manually pauses automatic model routing.
+Tool-loop continuations and steering messages received before a final assistant
+reply retain their model without calling Jev again. They retain their selected
+effort unless the current request explicitly changes it. An unsupported effort
+returns HTTP 400 with `unsupported_reasoning_effort`; a tool-loop request cannot
+silently change models to accommodate it. Child conversations keep separate
+routing state and honor their own inherited or explicit request effort. The
+router does not infer parent effort from child content.
 If assistant phase metadata is absent, follow-ups conservatively keep the current
 selection. Routing resumes for user input after a final reply or in a new conversation.
 This guard detects active-turn steering; a final reply does not establish that the
@@ -113,7 +148,8 @@ Conversation length never vetoes a routing recommendation. At low confidence,
 a downgrade from a stronger model uses the balanced fallback without going below
 Jev's recommended tier; uncertain upgrades remain capped. If the effort Choice
 is unavailable or uncertain, the selected model's default effort is used.
-Explicit reasoning settings win. If model routing is unavailable, policy keeps
+Per-request reasoning settings win over CLI defaults and cached decisions.
+If model routing is unavailable, policy keeps
 the current allowed model and compatible effort.
 
 ## Shutdown

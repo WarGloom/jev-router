@@ -63,3 +63,13 @@ test("Claude skill pre-approves its read-only explanation command", () => {
   const skill = readFileSync(new URL("../.claude/skills/jev-explain/SKILL.md", import.meta.url), "utf8");
   assert.match(skill, /^allowed-tools: Bash\(node \*\)$/m);
 });
+
+
+for (const [source, label] of [["request", "request"], ["cli", "CLI default"]]) {
+  test(`explains an explicit ${source} reasoning choice`, () => {
+    const output = formatExplanation({ model: "gpt-6.1-sol", effort: "high",
+      reasoningDecision: { source, effort: "high" } });
+    assert(output.includes(`Effort selected by: ${label}`));
+    assert.doesNotMatch(output, /Effort selected by: model default/);
+  });
+}

@@ -52,7 +52,7 @@ export function formatExplanation(status) {
     row(`Selected model: ${(status.model ?? status.tier ?? "unknown").toUpperCase()}`),
     row(`Reasoning effort: ${status.effort ?? "not recorded"}`),
     ...(status.reasoningDecision ? [
-      row(`Effort selected by: ${status.reasoningDecision.source === "jev" ? "Jev" : "model default"}`),
+      row(`Effort selected by: ${{ jev: "Jev", request: "request", cli: "CLI default" }[status.reasoningDecision.source] ?? "model default"}`),
       ...(Number.isFinite(status.reasoningDecision.confidence)
         ? [row(`Effort confidence: ${Math.round(status.reasoningDecision.confidence * 100)}%`)]
         : []),
