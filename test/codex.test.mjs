@@ -10,6 +10,7 @@ import {
   codexConversationKey,
   codexModels,
   codexNewTurnPrompt,
+  codexIsSteering,
   isCodexAuxiliaryPrompt,
   jevDecisionEvents,
   startCodexProxy,
@@ -64,6 +65,53 @@ test("reads only fresh Codex user turns", () => {
     null,
   );
   assert.equal(isCodexAuxiliaryPrompt("Generate a concise, single-line task title of at most 36 characters"), true);
+});
+
+test("steering during active work bypasses both Jev choices", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  let calls = 0;
+  const proxy = await startCodexProxy({
+    apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async ({ selection, models }) => {
+      calls++;
+      return { choice: selection === "effort" ? models[0].id : "gpt-6.1-sol", effort: "high", confidence: 0.95 };
+    },
+  });
+  t.after(proxy.close);
+  const input = [{ type: "additional_tools" }, { role: "user", content: "Investigate the lost updates" }];
+  const send = () => fetch(`http://127.0.0.1:${proxy.port}/responses`, {
+    method: "POST", headers: { "x-jev-session": proxy.token, "content-type": "application/json" },
+    body: JSON.stringify({ model: "jev-router", prompt_cache_key: "steering", input }),
+  });
+  assert.equal((await send()).status, 200);
+  assert.equal(calls, 2);
+  for (const item of [
+    { role: "assistant", phase: "commentary", content: "Inspecting the worker" },
+    { type: "function_call_output", call_id: "1", output: "worker source" },
+    { role: "assistant", phase: "analysis", content: "Compare the locks" },
+    { role: "assistant", content: "Still investigating" },
+    null,
+  ]) {
+    if (item) input.push(item);
+    input.push({ role: "user", content: "Also check the other worker" });
+    assert.equal(codexIsSteering({ input }), true);
+    assert.equal((await send()).status, 200);
+    assert.equal(calls, 2, "steering must not ask Jev for model or effort");
+    assert.equal(seen.at(-1).model, "gpt-6.1-sol");
+    assert.equal(seen.at(-1).reasoning.effort, "high");
+  }
+  input.push({ role: "assistant", phase: "final", content: "The fix is complete" });
+  input.push({ role: "user", content: "Translate this sentence" });
+  assert.equal(codexIsSteering({ input }), false);
+  assert.equal((await send()).status, 200);
+  assert.equal(calls, 4, "routing resumes after the final reply");
 });
 
 test("keeps sub-agent routing state separate", () => {
@@ -473,7 +521,7 @@ for (const includePreviousExchange of [false, true]) {
       { role: "user", content: "Find the cause of retries losing updates." },
       { role: "assistant", phase: "analysis", content: [{ type: "output_text", text: "private reasoning" }] },
       { type: "function_call_output", output: "private tool output" },
-      { role: "assistant", content: [{ type: "output_text", text: "The root cause is still uncertain across the API and worker." }] },
+      { role: "assistant", phase: "final", content: [{ type: "output_text", text: "The root cause is still uncertain across the API and worker." }] },
       { role: "assistant", content: [{ type: "output_text", text: "[Jev] routed this turn to a model." }] },
       { role: "user", content: "Fix it." },
     ];

@@ -78,6 +78,26 @@ export function codexNewTurnPrompt(body) {
   return null;
 }
 
+/** User input before a final reply continues the active work without rerouting. */
+export function codexIsSteering(body) {
+  if (!Array.isArray(body?.input)) return false;
+  const current = body.input.findLastIndex((item) => item?.role === "user" &&
+    cleanPrompt(textOf(item.content)) && !isCodexAuxiliaryPrompt(cleanPrompt(textOf(item.content))));
+  for (let i = current - 1; i >= 0; i--) {
+    const item = body.input[i];
+    if (item?.role === "assistant") {
+      if (textOf(item.content).trim().startsWith("[Jev]")) continue;
+      return item.phase !== "final";
+    }
+    if (["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "reasoning"].includes(item?.type)) return true;
+    if (item?.role === "user") {
+      const text = cleanPrompt(textOf(item.content));
+      if (text && !isCodexAuxiliaryPrompt(text)) return true;
+    }
+  }
+  return false;
+}
+
 /** Prior user/assistant exchange for interpreting a contextual follow-up. */
 export function codexPreviousExchange(body) {
   if (!Array.isArray(body?.input)) return [];
@@ -279,7 +299,7 @@ export async function startCodexProxy({
             let tier = current;
             let model = currentModel;
             let effort = currentEffort;
-            if (prompt && !explaining) {
+            if (prompt && !explaining && !(previous && codexIsSteering(body))) {
               const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
               const previousExchange = includePreviousExchange ? codexPreviousExchange(body) : [];
               const jev = await route({ prompt, previousExchange, selection: "model",

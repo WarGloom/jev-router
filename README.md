@@ -79,7 +79,12 @@ jev-codex -c 'model_reasoning_effort="high"'
 
 An explicit CLI effort setting restricts eligible models and pins the forwarded
 effort. Selecting a concrete allowed model manually pauses automatic model
-routing. Tool-loop continuations retain the selected model and effort for that turn.
+routing. Tool-loop continuations and steering messages received before a final
+assistant reply retain the selected model and effort without calling Jev again.
+If assistant phase metadata is absent, follow-ups conservatively keep the current
+selection. Routing resumes for user input after a final reply or in a new conversation.
+This guard detects active-turn steering; a final reply does not establish that the
+user's entire task is complete.
 
 Routing sends the current user request and model metadata to TypeSafe. Set
 `share_previous_exchange` to `true` in the owner-only local configuration to also
