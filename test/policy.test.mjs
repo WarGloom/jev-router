@@ -36,6 +36,13 @@ test("detectOverride only fires on a real instruction", () => {
   assert.equal(detectOverride("the opus of his career"), null);
 });
 
+test("a complaint that says a task runs on Luna is not a model override", () => {
+  const prompt = "Routing is broken; it always runs on Luna low, despite Jev recommending Sol high.";
+  assert.equal(detectOverride(prompt), null);
+  const out = decide({ ...base, prompt, current: "haiku", jev: sure("opus") });
+  assert.deepEqual(out, { tier: "opus", reason: "jev", changed: true });
+});
+
 test("keeps the current model when Jev is unreachable", () => {
   const out = decide({ ...base, jev: null });
   assert.equal(out.tier, "sonnet");
@@ -47,10 +54,10 @@ test("ignores a tier name Jev invented", () => {
   assert.equal(decide({ ...base, jev: sure("gpt-9") }).tier, "sonnet");
 });
 
-test("never downgrades on a low-confidence answer", () => {
+test("keeps a balanced current model when a downgrade is uncertain", () => {
   const out = decide({ ...base, jev: unsure("haiku") });
   assert.equal(out.tier, "sonnet");
-  assert.match(out.reason, /low-confidence-no-downgrade/);
+  assert.match(out.reason, /low-confidence-fallback/);
 });
 
 test("caps a low-confidence upgrade at the safe ceiling", () => {
@@ -63,10 +70,26 @@ test("still allows a confident upgrade to fable", () => {
   assert.equal(decide({ ...base, jev: sure("fable") }).tier, "fable");
 });
 
-test("refuses a downgrade once the cache rebuild costs more than it saves", () => {
-  const out = decide({ ...base, current: "opus", jev: sure("haiku"), contextTokens: 80000 });
-  assert.equal(out.tier, "opus");
-  assert.match(out.reason, /cache-rebuild/);
+test("context length never vetoes a confident downgrade", () => {
+  for (const contextTokens of [0, 19999, 20000, 20001, 70321, 80000, 200000, 475000]) {
+    assert.deepEqual(decide({ ...base, current: "opus", jev: { choice: "haiku", confidence: 0.64 }, contextTokens }), {
+      tier: "haiku", reason: "jev", changed: true,
+    });
+  }
+});
+
+test("uncertain downgrades leave a strong model for the balanced fallback", () => {
+  assert.deepEqual(decide({ ...base, current: "opus", jev: unsure("haiku"), contextTokens: 80000 }), {
+    tier: "sonnet", reason: "low-confidence-fallback", changed: true,
+  });
+});
+
+test("uncertainty does not downgrade below the recommended tier", () => {
+  assert.equal(decide({ ...base, current: "fable", jev: unsure("opus") }).tier, "opus");
+});
+
+test("explicit overrides still win in a long uncertain conversation", () => {
+  assert.equal(decide({ ...base, prompt: "use sol", current: "opus", jev: unsure("haiku"), contextTokens: 80000 }).tier, "opus");
 });
 
 test("allows the same downgrade early in a conversation", () => {

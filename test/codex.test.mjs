@@ -128,7 +128,18 @@ test("surfaces routing as a native commentary event", () => {
   assert.match(events, /response\.output_item\.done/);
   assert.match(events, /"phase":"commentary"/);
   assert.match(events, /\[Jev\] routed this turn to gpt-6\.1-sol/);
-  assert.match(events, /confidence 0\.91/);
+  assert.match(events, /confidence in recommendation: 91%/);
+
+  const fallback = jevDecisionEvents({
+    tier: "sonnet", effort: "low", confidence: 0.25,
+    reason: "low-confidence-fallback/no-change",
+    jev: { response: { answers: { model: { choice: "gpt-6-luna" } } } },
+    reasoningDecision: { source: "jev", confidence: 0.85 },
+  });
+  assert.match(fallback, /routed this turn to gpt-6\.1-terra \(low\)/);
+  assert.match(fallback, /Jev model recommendation: gpt-6-luna \(confidence in recommendation: 25%\)/);
+  assert.match(fallback, /Policy: low-confidence fallback; kept current model/);
+  assert.match(fallback, /confidence in effort recommendation: 85%/);
 
   const unavailable = jevDecisionEvents({
     tier: "sonnet",
@@ -184,9 +195,10 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
   const { port, token, close } = await startCodexProxy({
     chatgptBaseURL: `${upstreamURL}/backend-api/codex`,
     apiBaseURL: `${upstreamURL}/v1`,
-    route: async ({ models }) => {
+    route: async ({ models, selection }) => {
       routeCalls++;
-      assert.deepEqual(models.map((model) => model.id), ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"]);
+      assert.deepEqual(models.map((model) => model.id), selection === "effort"
+        ? ["gpt-6.1-sol"] : ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"]);
       return {
         choice: "gpt-6.1-sol",
         effort: "high",
@@ -252,7 +264,7 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
       ],
     }),
   });
-  assert.equal(routeCalls, 1);
+  assert.equal(routeCalls, 2);
   assert.equal(readStatus(statusId).confidence, 0.91);
   assert.equal(readStatus(statusId).history.length, 1);
 
@@ -265,7 +277,7 @@ test("proxy preserves Codex auth, picker, routing, and native decision output", 
       input: [{ role: "user", content: [{ type: "input_text", text: "$jev-explain" }] }],
     }),
   });
-  assert.equal(routeCalls, 1);
+  assert.equal(routeCalls, 2);
   assert.equal(seen[3].body.model, "gpt-6.1-sol");
   assert.equal(seen[3].body.reasoning.effort, "high");
   assert.equal(readStatus(statusId).metrics.reasoningRequired, 0.91);
@@ -355,7 +367,7 @@ test("effort override limits auto candidates and rejects incompatible manual req
 });
 
 
-test("policy fallback keeps compatible effort instead of rejected Jev effort", async (t) => {
+test("uncertain model fallback asks Jev for the final model's reasoning effort", async (t) => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -364,11 +376,21 @@ test("policy fallback keeps compatible effort instead of rejected Jev effort", a
   });
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   t.after(() => upstream.close());
-  let count = 0;
+  let turn = 0;
+  const routedEffortModels = [];
   const base = `http://127.0.0.1:${upstream.address().port}`;
   const { port, token, close } = await startCodexProxy({
     apiBaseURL: base,
-    route: async () => ({ choice: "gpt-6.1-terra", effort: "low", confidence: ++count === 1 ? 0.1 : 0.9 }),
+    route: async ({ models }) => {
+      if (models.length === 1) {
+        routedEffortModels.push(models[0].id);
+        return { choice: models[0].id, effort: turn === 1 ? "high" : "low", confidence: 0.9 };
+      }
+      turn++;
+      return turn === 1
+        ? { choice: "gpt-6-luna", effort: "low", confidence: 0.1 }
+        : { choice: "gpt-6.1-terra", effort: "low", confidence: 0.9 };
+    },
   });
   t.after(close);
   const url = `http://127.0.0.1:${port}/responses`;
@@ -380,12 +402,99 @@ test("policy fallback keeps compatible effort instead of rejected Jev effort", a
     assert.equal((await fetch(url, { method: "POST", headers, body: JSON.stringify(request(text)) })).status, 200);
   }
   assert.deepEqual(seen.map((body) => [body.model, body.reasoning.effort]), [
-    ["gpt-6.1-sol", "high"], ["gpt-6.1-sol", "high"],
+    ["gpt-6.1-terra", "high"], ["gpt-6.1-terra", "low"],
   ]);
+  assert.deepEqual(routedEffortModels, ["gpt-6.1-terra", "gpt-6.1-terra"]);
 });
 
 
-test("large first turn can downgrade before a routed cache exists", async (t) => {
+test("fresh Jev effort choice wins over the initial choice after a model change", async (t) => {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  const calls = [];
+  const { port, token, close } = await startCodexProxy({
+    apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
+    route: async (input) => {
+      calls.push(input.models.map((model) => model.id));
+      return input.models.length === 1
+        ? { choice: "gpt-6-luna", effort: "medium", confidence: 0.9 }
+        : { choice: "gpt-6-luna", effort: "low", confidence: 0.9 };
+    },
+  });
+  t.after(close);
+  const response = await fetch(`http://127.0.0.1:${port}/responses`, {
+    method: "POST",
+    headers: { "x-jev-session": token, "content-type": "application/json" },
+    body: JSON.stringify({ model: "jev-router", input: [
+      { type: "additional_tools" }, { role: "user", content: "moderately complex debugging" },
+    ] }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls, [
+    ["gpt-6-luna", "gpt-6.1-terra", "gpt-6.1-sol"],
+    ["gpt-6-luna"],
+  ]);
+  assert.equal(seen[0].model, "gpt-6-luna");
+  assert.equal(seen[0].reasoning.effort, "medium");
+});
+
+for (const includePreviousExchange of [false, true]) {
+  test(`follow-up effort selection with context sharing ${includePreviousExchange ? "enabled" : "disabled"}`, async (t) => {
+    const seen = [];
+    const upstream = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => { seen.push(JSON.parse(Buffer.concat(chunks))); res.end("ok"); });
+    });
+    await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+    t.after(() => upstream.close());
+    const calls = [];
+    let effortCalls = 0;
+    const { port, token, close } = await startCodexProxy({
+      includePreviousExchange,
+      apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
+      route: async (options) => {
+        calls.push(options);
+        return options.models.length === 1
+          ? { choice: "gpt-6.1-terra", effort: ++effortCalls === 1 ? "high" : "medium", confidence: 0.9 }
+          : { choice: "gpt-6.1-terra", confidence: 0.9 };
+      },
+    });
+    t.after(close);
+    const input = [
+      { type: "additional_tools" },
+      { role: "developer", content: "private developer instructions" },
+      { role: "user", content: "Find the cause of retries losing updates." },
+      { role: "assistant", phase: "analysis", content: [{ type: "output_text", text: "private reasoning" }] },
+      { type: "function_call_output", output: "private tool output" },
+      { role: "assistant", content: [{ type: "output_text", text: "The root cause is still uncertain across the API and worker." }] },
+      { role: "assistant", content: [{ type: "output_text", text: "[Jev] routed this turn to a model." }] },
+      { role: "user", content: "Fix it." },
+    ];
+    const send = () => fetch(`http://127.0.0.1:${port}/responses`, {
+      method: "POST", headers: { "x-jev-session": token, "content-type": "application/json" },
+      body: JSON.stringify({ model: "jev-router", prompt_cache_key: "context-check", input }),
+    });
+    assert.equal((await send()).status, 200);
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(calls[0].previousExchange, includePreviousExchange ? [
+      { role: "user", text: "Find the cause of retries losing updates." },
+      { role: "assistant", text: "The root cause is still uncertain across the API and worker." },
+    ] : []);
+    assert.equal(calls[0].selection, "model");
+    assert.equal(calls[1].selection, "effort");
+    assert.equal(effortCalls, 2);
+    assert.deepEqual(seen.map((body) => body.reasoning.effort), ["high", "medium"]);
+  });
+}
+
+test("large first and subsequent turns can downgrade model and effort", async (t) => {
   const seen = [];
   const upstream = http.createServer((req, res) => {
     const chunks = [];
@@ -395,13 +504,18 @@ test("large first turn can downgrade before a routed cache exists", async (t) =>
   await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
   t.after(() => upstream.close());
   const contexts = [];
-  let calls = 0;
+  const routedEffortModels = [];
+  let turns = 0;
   const { port, token, close } = await startCodexProxy({
     apiBaseURL: `http://127.0.0.1:${upstream.address().port}`,
-    route: async ({ contextTokens }) => {
+    route: async ({ contextTokens, models }) => {
       contexts.push(contextTokens);
-      calls++;
-      return { choice: calls === 2 ? "gpt-6.1-sol" : "gpt-6-luna", effort: "low", confidence: 0.92 };
+      if (models.length === 1) {
+        routedEffortModels.push(models[0].id);
+        return { choice: models[0].id, effort: "low", confidence: 0.92 };
+      }
+      turns++;
+      return { choice: turns === 2 ? "gpt-6.1-sol" : "gpt-6-luna", effort: "low", confidence: 0.92 };
     },
   });
   t.after(close);
@@ -417,6 +531,8 @@ test("large first turn can downgrade before a routed cache exists", async (t) =>
   assert.equal((await send("cached")).status, 200);
   assert.equal(seen[1].model, "gpt-6.1-sol");
   assert.equal((await send("cached")).status, 200);
-  assert.equal(seen[2].model, "gpt-6.1-sol");
+  assert.equal(seen[2].model, "gpt-6-luna");
+  assert.equal(seen[2].reasoning.effort, "low");
   assert(contexts[2] > 20000);
+  assert.deepEqual(routedEffortModels, ["gpt-6-luna", "gpt-6.1-sol", "gpt-6-luna"]);
 });

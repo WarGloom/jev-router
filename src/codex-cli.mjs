@@ -62,7 +62,8 @@ export function resolveCodex() {
   return null;
 }
 
-export const codexArgs = (baseURL, args) => [
+export const codexArgs = (baseURL, args, statusId) => [
+  ...(statusId ? ["--config", `shell_environment_policy.set.JEV_CODEX_STATUS_ID=${JSON.stringify(statusId)}`] : []),
   ...(args.some((arg) => arg === "--model" || arg === "-m" || arg.startsWith("--model="))
     ? []
     : ["--model", CODEX_AUTO_MODEL]),
@@ -120,15 +121,17 @@ export async function runCodex() {
       process.exitCode = 1;
       return;
     }
-    try { loadEnv(); readJevApiKey(); } catch {
+    let routingConfig;
+    try { routingConfig = loadEnv(); readJevApiKey(); } catch {
       process.stderr.write("[jev] Cannot read the owner-only TypeSafe key file; check ~/.config/jev-router/config.json.\n");
       process.exitCode = 1;
       return;
     }
-    const proxy = await startCodexProxy({ statusId, effortOverride: explicitEffort(args) });
+    const proxy = await startCodexProxy({ statusId, effortOverride: explicitEffort(args),
+      includePreviousExchange: routingConfig.sharePreviousExchange });
     close = proxy.close;
     env = { ...codexEnvironment(proxy.token), JEV_CODEX_STATUS_ID: statusId };
-    args = codexArgs(`http://127.0.0.1:${proxy.port}`, args);
+    args = codexArgs(`http://127.0.0.1:${proxy.port}`, args, statusId);
   }
 
   const childArgs = [...command.prefix, ...args];

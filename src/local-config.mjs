@@ -37,12 +37,15 @@ export function readLocalConfig() {
   } catch (err) {
     if (err.code !== "ENOENT") throw err;
   }
-  if (!data || typeof data !== "object" || Array.isArray(data) || Object.keys(data).some((key) => key !== "api_key_file")) {
-    throw new Error("Jev configuration supports only api_key_file");
+  if (!data || typeof data !== "object" || Array.isArray(data) || Object.keys(data).some((key) => !["api_key_file", "share_previous_exchange"].includes(key))) {
+    throw new Error("Jev configuration supports only api_key_file and share_previous_exchange");
   }
   const apiKeyFile = data.api_key_file ?? join(homedir(), ".config", "typesafe", "api-key");
   if (typeof apiKeyFile !== "string" || !isAbsolute(apiKeyFile)) throw new Error("api_key_file must be absolute");
-  return { apiKeyFile };
+  if (data.share_previous_exchange !== undefined && typeof data.share_previous_exchange !== "boolean") {
+    throw new Error("share_previous_exchange must be boolean");
+  }
+  return { apiKeyFile, sharePreviousExchange: data.share_previous_exchange ?? false };
 }
 
 export function readJevApiKey() {
@@ -80,7 +83,8 @@ export function writePrivateFile(path, content) {
 }
 
 export function readPrivateStateFile(path) {
-  ensureStateDir();
+  const stat = lstatSync(STATE_DIR);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid() || (stat.mode & 0o077)) throw new Error("Unsafe Jev state directory");
   if (dirname(path) !== STATE_DIR) throw new Error("Jev state file must stay in its private directory");
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {

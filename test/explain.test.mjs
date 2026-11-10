@@ -27,8 +27,27 @@ test("formats the last routing decision", () => {
   assert.match(output, /Context tokens: 6200/);
   assert.match(output, /Recommended tier: SONNET/);
   assert.match(output, /Selected model: SONNET/);
-  assert.match(output, /Confidence: 94%/);
+  assert.match(output, /Model-choice confidence: 94%/);
   assert.match(output, /Decision: Jev recommendation/);
+});
+
+test("reports the separate Jev reasoning decision after a model change", () => {
+  const output = formatExplanation({
+    model: "gpt-6.1-terra",
+    effort: "high",
+    reasoningDecision: { source: "jev", effort: "high", confidence: 0.91 },
+  });
+  assert.match(output, /Effort selected by: Jev/);
+  assert.match(output, /Effort confidence: 91%/);
+});
+
+test("shows Jev's model recommendation separately from a policy fallback", () => {
+  const output = formatExplanation({
+    tier: "sonnet", model: "gpt-6.1-terra", effort: "medium",
+    jev: { response: { answers: { model: { choice: "gpt-6.1-sol" } } } },
+  });
+  assert.match(output, /Recommended tier: GPT-6.1-SOL/);
+  assert.match(output, /Selected model: GPT-6.1-TERRA/);
 });
 
 test("shows the concrete provider model when available", () => {

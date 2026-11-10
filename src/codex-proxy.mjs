@@ -50,7 +50,7 @@ const textOf = (content) => {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return content
-    .filter((item) => item?.type === "text" || item?.type === "input_text")
+    .filter((item) => item?.type === "text" || item?.type === "input_text" || item?.type === "output_text")
     .map((item) => item.text)
     .join("\n");
 };
@@ -78,6 +78,27 @@ export function codexNewTurnPrompt(body) {
   return null;
 }
 
+/** Prior user/assistant exchange for interpreting a contextual follow-up. */
+export function codexPreviousExchange(body) {
+  if (!Array.isArray(body?.input)) return [];
+  const current = body.input.findLastIndex((item) => item?.role === "user" &&
+    cleanPrompt(textOf(item.content)) && !isCodexAuxiliaryPrompt(cleanPrompt(textOf(item.content))));
+  let assistant = null;
+  for (let i = current - 1; i >= 0; i--) {
+    const item = body.input[i];
+    if (item?.role === "assistant" && item.phase !== "analysis" && !assistant) {
+      const text = cleanPrompt(textOf(item.content));
+      if (text && !text.startsWith("[Jev]")) assistant = { role: "assistant", text };
+    }
+    if (item?.role === "user") {
+      const text = cleanPrompt(textOf(item.content));
+      if (!text || isCodexAuxiliaryPrompt(text)) continue;
+      return assistant ? [{ role: "user", text }, assistant] : [];
+    }
+  }
+  return [];
+}
+
 export function codexConversationKey(body) {
   const stable =
     body?.prompt_cache_key ??
@@ -99,7 +120,7 @@ export function addJevModel(catalog) {
     ...template,
     slug: CODEX_AUTO_MODEL,
     display_name: "Jev Router",
-    description: "Jev picks the cheapest model that can complete each turn.",
+    description: "Jev chooses a model for the task, then its supported reasoning level.",
     visibility: "list",
     supported_in_api: true,
     priority: 0,
@@ -125,13 +146,25 @@ export const upstreamFor = (
   apiBaseURL = API_BASE_URL,
 ) => /\/models(?:\?|$)/.test(path) || headers["chatgpt-account-id"] ? chatgptBaseURL : apiBaseURL;
 
-export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, confidence, reason }) {
-  const detail = confidence == null ? reason : `${reason}, confidence ${confidence.toFixed(2)}`;
+export function jevDecisionEvents({ tier, model = codexModelOf(tier), effort, confidence, reason, jev, reasoningDecision }) {
+  const recommended = jev?.response?.answers?.model?.choice;
+  const recommendation = `Jev model recommendation: ${recommended ?? "not recorded"}` +
+    (Number.isFinite(confidence) ? ` (confidence in recommendation: ${Math.round(confidence * 100)}%)` : "");
+  let policy = reason.includes("override") ? "explicit model override"
+    : reason.includes("low-confidence-fallback") ? "low-confidence fallback"
+    : reason.includes("low-confidence-capped") ? "low-confidence upgrade capped"
+    : "accepted Jev recommendation";
+  if (reason.includes("+unavailable")) policy += "; nearest available model";
+  if (reason.includes("/no-change")) policy += "; kept current model";
+  const reasoning = reasoningDecision?.source === "jev"
+    ? ` Reasoning effort selected by Jev${Number.isFinite(reasoningDecision.confidence)
+      ? ` (confidence in effort recommendation: ${Math.round(reasoningDecision.confidence * 100)}%)` : ""}.`
+    : reasoningDecision?.source === "model-default" ? " Reasoning effort: model default." : "";
   const id = `jev-${randomUUID()}`;
   const modelWithEffort = effort ? `${model} (${effort})` : model;
   const text = reason.startsWith("jev-unavailable")
     ? `[Jev] unavailable; using ${modelWithEffort}. Check api_key_file in ~/.config/jev-router/config.json.`
-    : `[Jev] routed this turn to ${modelWithEffort} (${detail}).`;
+    : `[Jev] routed this turn to ${modelWithEffort}. ${recommendation}. Policy: ${policy}.${reasoning}`;
   const item = {
     type: "message",
     role: "assistant",
@@ -156,13 +189,22 @@ export async function startCodexProxy({
   route = askJev,
   statusId = "",
   effortOverride = null,
+  includePreviousExchange = false,
 } = {}) {
   const token = randomBytes(32).toString("hex");
   const expectedToken = Buffer.from(token);
   const states = new Map();
   const models = new Map();
+  const upstreams = new Set();
+  const lifecycle = new AbortController();
+  let closing = false;
 
   const server = http.createServer((req, res) => {
+    if (closing) {
+      res.writeHead(503).end();
+      req.resume();
+      return;
+    }
     const supplied = req.headers["x-jev-session"];
     const suppliedToken = typeof supplied === "string" ? Buffer.from(supplied) : Buffer.alloc(0);
     if (req.headers.origin !== undefined || suppliedToken.length !== expectedToken.length ||
@@ -171,6 +213,13 @@ export async function startCodexProxy({
       req.resume();
       return;
     }
+    const requestAbort = new AbortController();
+    const signal = AbortSignal.any([lifecycle.signal, requestAbort.signal]);
+    const cancelled = () => signal.aborted || res.destroyed;
+    req.once("aborted", () => requestAbort.abort());
+    res.once("close", () => {
+      if (!res.writableFinished) requestAbort.abort();
+    });
     const maxBody = 32 * 1024 * 1024;
     const chunks = [];
     let size = 0;
@@ -188,7 +237,7 @@ export async function startCodexProxy({
       chunks.push(chunk);
     });
     req.on("end", async () => {
-      if (tooLarge) return;
+      if (tooLarge || cancelled()) return;
       let out = Buffer.concat(chunks);
       let routing;
       const isResponse = req.method === "POST" && /\/responses(?:\?|$)/.test(req.url ?? "");
@@ -232,14 +281,16 @@ export async function startCodexProxy({
             let effort = currentEffort;
             if (prompt && !explaining) {
               const contextTokens = Math.round(JSON.stringify(body.input).length / 4);
-              const jev = await route({ prompt, current: currentModel, currentEffort, contextTokens, models: candidates, effortOverride });
+              const previousExchange = includePreviousExchange ? codexPreviousExchange(body) : [];
+              const jev = await route({ prompt, previousExchange, selection: "model",
+                current: currentModel, currentEffort, contextTokens, models: candidates, effortOverride, signal });
+              if (cancelled()) return;
               const chosen = candidates.find((candidate) => candidate.id === jev?.choice);
               const decision = decide({
                 prompt,
                 jev: jev && { ...jev, choice: chosen?.tier },
                 current,
                 available,
-                contextTokens: previous ? contextTokens : 0,
               });
               tier = decision.tier;
               model =
@@ -249,10 +300,33 @@ export async function startCodexProxy({
                     ? currentModel
                     : modelForTier(candidates, tier);
               const selected = candidates.find((candidate) => candidate.id === model);
-              effort = effortOverride ?? compatibleEffort(selected, currentEffort);
-              if (!effortOverride && decision.reason.startsWith("jev") && model === chosen?.id &&
-                  Number.isFinite(jev.confidence) && jev.confidence >= THRESHOLDS.minConfidence &&
-                  supportsEffort(selected, jev.effort)) effort = jev.effort;
+              // Model and reasoning are separate choices. Every new task gets an effort
+              // decision for the final model, including when the model stays the same.
+              effort = effortOverride ?? (model === currentModel
+                ? compatibleEffort(selected, currentEffort)
+                : selected.defaultEffort);
+              let reasoningDecision = null;
+              if (!effortOverride && jev) {
+                effort = selected.defaultEffort;
+                try {
+                  const effortAnswer = await route({
+                    prompt, previousExchange, selection: "effort", current: model,
+                    currentEffort: effort, contextTokens, models: [selected], signal,
+                  });
+                  if (cancelled()) return;
+                  if (effortAnswer?.choice === model && Number.isFinite(effortAnswer.confidence) &&
+                      effortAnswer.confidence >= THRESHOLDS.minConfidence &&
+                      supportsEffort(selected, effortAnswer.effort)) {
+                    effort = effortAnswer.effort;
+                    reasoningDecision = { effort, confidence: effortAnswer.confidence, source: "jev",
+                      jev: { request: effortAnswer.request, response: effortAnswer.response } };
+                  }
+                } catch (err) {
+                  if (cancelled()) return;
+                  debug(`reasoning routing failed, keeping ${model} default (${err.name})`);
+                }
+                reasoningDecision ??= { effort, source: "model-default" };
+              }
               states.set(key, { tier, model, effort });
               routing = {
                 prompt,
@@ -262,6 +336,7 @@ export async function startCodexProxy({
                 confidence: jev?.confidence ?? null,
                 metrics: jev?.metrics ?? null,
                 reason: decision.reason,
+                reasoningDecision,
                 jev: jev ? { request: jev.request, response: jev.response } : null,
                 at: Date.now(),
               };
@@ -283,12 +358,14 @@ export async function startCodexProxy({
           }
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
+          if (cancelled()) return;
           debug(`codex could not process body: ${err.message}`);
           res.writeHead(400).end();
           return;
         }
       }
 
+      if (cancelled()) return;
       const base = upstreamFor(req.headers, req.url, chatgptBaseURL, apiBaseURL);
       const target = new URL(base);
       const transport = target.protocol === "http:" ? http : https;
@@ -302,14 +379,20 @@ export async function startCodexProxy({
           path: upstreamPath(base, req.url ?? "/"),
           method: req.method,
           headers,
+          signal,
         },
         (response) => {
+          if (cancelled()) {
+            response.destroy();
+            return;
+          }
           const responseHeaders = { ...response.headers };
           const isModels = req.method === "GET" && /\/models(?:\?|$)/.test(req.url ?? "");
           if (isModels) {
             const body = [];
             response.on("data", (chunk) => body.push(chunk));
             response.on("end", () => {
+              if (cancelled()) return;
               let data = Buffer.concat(body);
               try {
                 const catalog = addJevModel(JSON.parse(data.toString()));
@@ -335,6 +418,7 @@ export async function startCodexProxy({
           let pending = "";
           let inspected = false;
           response.on("data", (chunk) => {
+            if (cancelled()) return;
             if (inspected) return void res.write(chunk);
             pending += chunk.toString();
             const end = pending.indexOf("\n\n");
@@ -349,6 +433,7 @@ export async function startCodexProxy({
             inspected = true;
           });
           response.on("end", () => {
+            if (cancelled()) return;
             if (pending) {
               debug("codex decision display skip");
               res.write(pending);
@@ -357,7 +442,10 @@ export async function startCodexProxy({
           });
         },
       );
+      upstreams.add(upstream);
+      upstream.once("close", () => upstreams.delete(upstream));
       upstream.on("error", (err) => {
+        if (cancelled()) return;
         debug(`codex upstream error: ${err.message}`);
         if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { message: err.message, type: "proxy_error" } }));
@@ -368,5 +456,15 @@ export async function startCodexProxy({
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { port: server.address().port, token, close: () => server.close() };
+  const close = () => {
+    if (!closing) {
+      closing = true;
+      lifecycle.abort();
+      server.close();
+      server.closeAllConnections();
+      for (const upstream of upstreams) upstream.destroy();
+    }
+    return server;
+  };
+  return { port: server.address().port, token, close };
 }

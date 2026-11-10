@@ -31,10 +31,9 @@ function clampToAvailable(tier, available) {
  * @param {?{choice: string, confidence: number}} input.jev  null when Jev failed
  * @param {string} input.current       tier currently active in the session
  * @param {string[]} input.available   tier names the account can run
- * @param {number} input.contextTokens approximate size of the conversation so far
  * @returns {{tier: string, reason: string, changed: boolean}}
  */
-export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
+export function decide({ prompt, jev, current, available }) {
   const settle = (tier, reason) => {
     const final = clampToAvailable(tier, available) ?? current;
     const why = final === tier ? reason : `${reason}+unavailable`;
@@ -49,13 +48,13 @@ export function decide({ prompt, jev, current, available, contextTokens = 0 }) {
   let target = jev.choice;
 
   if (jev.confidence < THRESHOLDS.minConfidence) {
-    if (rankOf(target) < rankOf(current)) return settle(current, "low-confidence-no-downgrade");
+    if (rankOf(target) < rankOf(current)) {
+      // Use the balanced fallback without dropping below Jev's recommended tier.
+      const fallback = Math.max(rankOf(target), Math.min(rankOf(current), rankOf(THRESHOLDS.uncertainCeiling)));
+      return settle(TIER_NAMES[fallback], "low-confidence-fallback");
+    }
     const ceiling = Math.max(rankOf(current), rankOf(THRESHOLDS.uncertainCeiling));
     if (rankOf(target) > ceiling) return settle(TIER_NAMES[ceiling], "low-confidence-capped");
-  }
-
-  if (rankOf(target) < rankOf(current) && contextTokens > THRESHOLDS.downgradeMaxContextTokens) {
-    return settle(current, "downgrade-not-worth-cache-rebuild");
   }
 
   return settle(target, "jev");

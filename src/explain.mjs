@@ -16,6 +16,8 @@ const decision = (reason = "") => {
   if (reason.includes("jev-unavailable")) return "Jev unavailable; held";
   if (reason.includes("low-confidence-no-downgrade")) return "low confidence; held";
   if (reason.includes("low-confidence-capped")) return "low confidence; capped";
+  if (reason.includes("low-confidence-fallback")) return "low confidence; fallback";
+  // Older saved decisions can still contain the removed cache veto reason.
   if (reason.includes("cache-rebuild")) return "cache rebuild avoided";
   if (reason.includes("unavailable")) return "nearest available tier";
   return "Jev recommendation";
@@ -27,7 +29,8 @@ export function formatExplanation(status) {
 
   const m = status.metrics ?? {};
   const request = status.jev?.request?.state;
-  const recommendation = status.jev?.response?.answers?.model_tier?.choice ?? status.tier ?? "unknown";
+  const recommendation = status.jev?.response?.answers?.model?.choice ??
+    status.jev?.response?.answers?.model_tier?.choice ?? status.tier ?? "unknown";
   return [
     `┌${"─".repeat(WIDTH)}┐`,
     row("Jev Router"),
@@ -46,8 +49,14 @@ export function formatExplanation(status) {
     row(`Recommended tier: ${recommendation.toUpperCase()}`),
     row(`Selected model: ${(status.model ?? status.tier ?? "unknown").toUpperCase()}`),
     row(`Reasoning effort: ${status.effort ?? "not recorded"}`),
+    ...(status.reasoningDecision ? [
+      row(`Effort selected by: ${status.reasoningDecision.source === "jev" ? "Jev" : "model default"}`),
+      ...(Number.isFinite(status.reasoningDecision.confidence)
+        ? [row(`Effort confidence: ${Math.round(status.reasoningDecision.confidence * 100)}%`)]
+        : []),
+    ] : []),
     row(),
-    row(`Confidence: ${status.confidence == null ? "n/a" : `${Math.round(status.confidence * 100)}%`}`),
+    row(`Model-choice confidence: ${status.confidence == null ? "n/a" : `${Math.round(status.confidence * 100)}%`}`),
     row(`Decision: ${decision(status.reason)}`),
     `└${"─".repeat(WIDTH)}┘`,
   ].join("\n");

@@ -168,8 +168,7 @@ export function observeModel(state, current) {
 
 
 export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = askJev } = {}) {
-  // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
-  // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
+  // Model routed for each conversation's turn in flight, reused by tool continuations.
   const convos = new Map();
   const catalog = new Map();
   const stateFor = (key) => {
@@ -212,7 +211,7 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
           } else {
             const key = conversationKey(body);
             const state = stateFor(key);
-            // What the prompt cache was built on, which is what a downgrade would discard.
+            // Most recently selected tier; keep it across tool continuations.
             const current = state.tier ?? "opus";
             const prompt = newTurnPrompt(body);
             const explaining = prompt?.includes("<jev-explain>");
@@ -232,7 +231,6 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
                 jev: tierAnswer,
                 current,
                 available,
-                contextTokens,
               });
               const model =
                 shouldUseExactModel(reason, chosen?.tier, tier)

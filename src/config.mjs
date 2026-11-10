@@ -46,16 +46,10 @@ export const availableTiers = () =>
   TIER_NAMES.filter((n) => n !== "fable" || process.env.JEV_ALLOW_FABLE === "1");
 
 export const THRESHOLDS = {
-  /** Below this Jev confidence we refuse to downgrade and cap upgrades at `uncertainCeiling`. */
+  /** Below this confidence, use a balanced downgrade fallback and cap uncertain upgrades. */
   minConfidence: 0.3,
   /** Safest tier to land on when Jev is unsure. */
   uncertainCeiling: "sonnet",
-  /**
-   * Switching models invalidates the prompt cache; the next turn re-sends the whole
-   * conversation. Measured at ~23.6k cache-creation tokens switching into Opus, so a
-   * downgrade only pays off while the conversation is still small.
-   */
-  downgradeMaxContextTokens: 20000,
   /**
    * Per-attempt Jev HTTP timeout and the hard wall-clock deadline for the whole routing
    * call. Measured: ~300-350ms warm, ~900-1000ms on the first call (TLS handshake), so the
@@ -87,7 +81,7 @@ export const COMPLEXITY_MAX_SCORE = COMPLEXITY_SCALE.length - 1;
 export const OVERRIDE_PATTERNS = TIERS.map((t) => ({
   tier: t.name,
   re: new RegExp(
-    `\\b(?:use|switch to|with|on)\\s+(?:${{
+    `\\b(?:use|switch to|with)\\s+(?:${{
       haiku: "haiku|fast|luna",
       sonnet: "sonnet|balanced|terra",
       opus: "opus|strong|sol",
@@ -135,9 +129,39 @@ const GUIDANCE = {
   },
 };
 
+export const CODEX_CAPABILITIES = {
+  'gpt-6-luna': {
+    suitable: 'Self-contained factual answers, translation, formatting, or a single fully specified mechanical edit with an obvious check.',
+    insufficient: 'Unknown-cause debugging, ambiguous failures, design decisions, cross-module reasoning, security or concurrency analysis. Raising effort does not remove these capability limits.',
+  },
+  'gpt-6.1-terra': {
+    suitable: 'Ordinary scoped engineering: implement a specified function or endpoint, fix an understood local bug, inspect relevant source and interpret tests with a clear goal.',
+    insufficient: 'Deep unknown-cause or cross-component debugging, security trust boundaries, subtle concurrency, architectural decisions or difficult correctness arguments.',
+  },
+  'gpt-6.1-sol': {
+    suitable: 'Difficult reasoning: unknown-cause diagnosis, competing hypotheses, cross-component behavior, security, concurrency, architecture, or consequential correctness decisions.',
+    unnecessary: 'Direct factual answers and fully specified mechanical work.',
+  },
+};
+
+export const REASONING_CRITERIA = {
+  low: 'Direct answer or mechanical action; no substantial reasoning chain or uncertainty to resolve.',
+  medium: 'A bounded sequence of reasoning steps; ordinary implementation or an understood local bug.',
+  high: 'Unknown-cause investigation, competing hypotheses, or nontrivial interactions and correctness reasoning.',
+  xhigh: 'Several coupled hard constraints requiring deep cross-module reasoning and failure analysis.',
+  max: 'Sustained difficult reasoning about interacting algorithms, invariants, concurrency or proofs.',
+  ultra: 'The hardest multi-component work that benefits from automatic task delegation.',
+};
+
 /** Build a Jev choice from the exact models available to this account and CLI. */
-export const questionForModels = (models) =>
-  choice(
+export const questionForModels = (models) => {
+  if (models.every(({ id }) => Object.hasOwn(CODEX_CAPABILITIES, id))) {
+    return choice(
+      "Which model has sufficient capability for this task? Prefer an efficient model within the required capability class.",
+      Object.fromEntries(models.map(({ id }) => [id, CODEX_CAPABILITIES[id]])),
+    );
+  }
+  return choice(
     [
       "Pick the cheapest exact model that can fully complete this coding request in one pass, without retrying on a stronger model.",
       "Treat different model versions as separate choices. Judge required reasoning, not requested reply length.",
@@ -149,6 +173,20 @@ export const questionForModels = (models) =>
       ]),
     ),
   );
+};
+
+/** Ask only about levels supported by the model already selected by policy. */
+export const questionForEffort = (model, effortOverride = null) => choice(
+  {
+    question: `Which supported reasoning level should ${model.id} use for this task?`,
+    capability: CODEX_CAPABILITIES[model.id] ?? { model: model.description ?? model.id, ...GUIDANCE[model.tier] },
+  },
+  Object.fromEntries((model.efforts ?? []).flatMap((level) => {
+    const effort = typeof level === "string" ? level : level.effort;
+    if (!effort || (effortOverride && effort !== effortOverride)) return [];
+    return [[effort, REASONING_CRITERIA[effort] ?? (typeof level === "string" ? effort : level.description ?? effort)]];
+  })),
+);
 
 /** Whether policy accepted Jev's exact model, including a version change within one tier. */
 export const shouldUseExactModel = (reason, chosenTier, finalTier) =>

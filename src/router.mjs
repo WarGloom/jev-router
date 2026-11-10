@@ -4,6 +4,7 @@ import {
   CONTEXT_WINDOW_TOKENS,
   QUESTIONS,
   questionForModels,
+  questionForEffort,
   THRESHOLDS,
 } from "./config.mjs";
 import { log } from "./log.mjs";
@@ -53,47 +54,71 @@ export function decodeConfiguration(answer, configurations) {
   return configuration ? { ...answer, configurationChoice: answer.choice, choice: configuration.model, effort: configuration.effort } : null;
 }
 
+/** Build one model question or one final-model reasoning question. */
+export function buildRoutingRequest({ prompt, current, currentEffort, contextTokens, models = [], effortOverride = null, selection = "model", previousExchange = [] }) {
+  if (!models.length || !["model", "effort"].includes(selection)) return null;
+  const eligible = models.filter((model) => !effortOverride || (model.efforts ?? []).some((level) =>
+    (typeof level === "string" ? level : level.effort) === effortOverride));
+  if (!eligible.length || (selection === "effort" && models.length !== 1)) return null;
+  const modelQuestion = selection === "effort"
+    ? questionForEffort(eligible[0], effortOverride)
+    : questionForModels(eligible);
+  if (!Object.keys(modelQuestion.criteria).length) return null;
+  const context = previousExchange.filter((item) =>
+    ["user", "assistant"].includes(item?.role) && typeof item.text === "string" && item.text.trim())
+    .map(({ role, text }) => ({ role, text }));
+  return {
+    state: {
+      request: prompt,
+      ...(context.length ? { previous_exchange: context } : {}),
+      session: { current_model: current, current_effort: currentEffort ?? null, context_tokens: contextTokens },
+      environment: { available_models: eligible.map((model) => model.id) },
+    },
+    questions: { ...(selection === "model" ? QUESTIONS : {}), model: modelQuestion },
+  };
+}
+
+/** Validate the exact option before normalizing a final model's reasoning choice. */
+export function decodeRoutingAnswer(answer, request, effortModel = null) {
+  if (!answer || !Object.hasOwn(request.questions.model.criteria, answer.choice)) return null;
+  return effortModel ? { ...answer, choice: effortModel.id, effort: answer.choice } : answer;
+}
+
 /**
  * Asks Jev which tier fits this prompt. Returns null on any failure, which the policy
  * layer reads as "keep the current model" — routing must never block a prompt.
  *
  * @returns {Promise<?{choice: string, confidence: number, probabilities: object, metrics: object, ms: number}>}
  */
-export async function askJev({ prompt, current, currentEffort, contextTokens, models, effortOverride = null }) {
-  if (!models?.length) return null;
-  const joint = models.some((model) => Array.isArray(model.efforts));
-  const configurations = joint ? configurationChoices(models, effortOverride) : null;
-  if (joint && !configurations.size) return null;
+export async function askJev({ prompt, current, currentEffort, contextTokens, models, effortOverride = null, selection = "model", previousExchange = [], signal }) {
+  if (signal?.aborted) return null;
+  const request = buildRoutingRequest({ prompt, current, currentEffort, contextTokens, models, effortOverride, selection, previousExchange });
+  if (!request) return null;
   const started = Date.now();
   const abort = new AbortController();
+  const requestSignal = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
   const deadline = setTimeout(() => abort.abort(), THRESHOLDS.jevDeadlineMs);
-  const request = {
-    state: {
-      request: prompt,
-      session: { current_model: current, current_effort: currentEffort ?? null, context_tokens: contextTokens },
-      environment: { available_models: models.map((model) => model.id) },
-    },
-    questions: { ...QUESTIONS, model: joint ? configurationQuestion(configurations) : questionForModels(models) },
-  };
   try {
-    const result = await getClient().systemOne(request, { signal: abort.signal });
-    const { model: answer, task_complexity, reasoning_required, tool_complexity } = result.answers;
-    const selection = joint ? decodeConfiguration(answer, configurations) : answer;
-    if (!selection) return null;
+    const result = await getClient().systemOne(request, { signal: requestSignal });
+    const answers = result.answers ?? {};
+    const selected = decodeRoutingAnswer(answers.model, request, selection === "effort" ? models[0] : null);
+    if (!selected) return null;
+    const scored = ["task_complexity", "reasoning_required", "tool_complexity"]
+      .every((key) => Number.isFinite(answers[key]?.score));
     return {
-      ...selection,
+      ...selected,
       request,
       response: result,
-      metrics: {
-        taskComplexity: task_complexity.score / COMPLEXITY_MAX_SCORE,
-        reasoningRequired: reasoning_required.score / COMPLEXITY_MAX_SCORE,
-        toolComplexity: tool_complexity.score / COMPLEXITY_MAX_SCORE,
+      metrics: scored ? {
+        taskComplexity: answers.task_complexity.score / COMPLEXITY_MAX_SCORE,
+        reasoningRequired: answers.reasoning_required.score / COMPLEXITY_MAX_SCORE,
+        toolComplexity: answers.tool_complexity.score / COMPLEXITY_MAX_SCORE,
         contextSize: Math.min(contextTokens / CONTEXT_WINDOW_TOKENS, 1),
-      },
+      } : null,
       ms: Date.now() - started,
     };
   } catch (err) {
-    log(`routing failed, keeping ${current} (${err.name})`);
+    if (!signal?.aborted) log(`routing failed, keeping ${current} (${err.name})`);
     return null;
   } finally {
     clearTimeout(deadline);

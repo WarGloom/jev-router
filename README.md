@@ -36,7 +36,7 @@ To reference another existing key file, create an owner-only
 `~/.config/jev-router/config.json` containing an absolute path:
 
 ```json
-{"api_key_file": "/absolute/path/to/typesafe-api-key"}
+{"api_key_file": "/absolute/path/to/typesafe-api-key", "share_previous_exchange": false}
 ```
 
 The config file also requires owner-only permissions. No project dotenv files
@@ -50,8 +50,12 @@ Codex authentication is forwarded to its normal upstream backend.
 ## Model and effort selection
 
 Leave `jev-router` selected in the native model picker for automatic routing.
-One Jev Choice selects a valid model-and-effort pair from the bundled Codex
-capability catalog:
+Jev first chooses a model using explicit capability criteria: Luna for simple
+self-contained or mechanical work, Terra for ordinary scoped engineering, and
+Sol for unknown-cause diagnosis, architecture, security, or concurrency. After
+policy resolves the final model, a separate Jev Choice selects one of that
+model's supported reasoning levels on every new user turn. Supported levels
+come from the Codex capability catalog:
 
 | Model | Supported efforts |
 | --- | --- |
@@ -73,21 +77,40 @@ jev-codex exec "Fix the failing test"
 jev-codex -c 'model_reasoning_effort="high"'
 ```
 
-An explicit effort setting restricts the eligible configurations. Selecting a
-concrete allowed model manually pauses automatic model routing. Tool-loop
-continuations retain the selected model and effort for that turn.
+An explicit CLI effort setting restricts eligible models and pins the forwarded
+effort. Selecting a concrete allowed model manually pauses automatic model
+routing. Tool-loop continuations retain the selected model and effort for that turn.
+
+Routing sends the current user request and model metadata to TypeSafe. Set
+`share_previous_exchange` to `true` in the owner-only local configuration to also
+send the preceding user/assistant exchange for contextual follow-ups. It defaults
+to `false`. Developer instructions, analysis messages, raw tool results and
+injected routing notices are excluded from that exchange. Exact routing requests
+and model/effort decisions are retained in the private routing history.
 
 The native footer can show the routing sentinel and client effort setting. The
 injected commentary reports the actual forwarded pair:
 
 ```text
-[Jev] routed this turn to gpt-6-luna (low) (jev, confidence 0.93).
+[Jev] routed this turn to gpt-6-luna (low). Jev model recommendation: gpt-6-luna (confidence in recommendation: 93%). Policy: accepted Jev recommendation. Reasoning effort: model default.
 ```
 
-Confidence and conversation-cache safeguards still apply to routing decisions.
-A large initial prompt is eligible for routing; cache downgrade protection
-applies only after a previous routed turn. If Jev is unavailable, the policy
-keeps an allowed fallback with a compatible effort.
+Confidence describes Jev's model recommendation, including when policy selects a
+different model. A separate effort confidence is shown when Jev selects reasoning.
+
+Conversation length never vetoes a routing recommendation. At low confidence,
+a downgrade from a stronger model uses the balanced fallback without going below
+Jev's recommended tier; uncertain upgrades remain capped. If the effort Choice
+is unavailable or uncertain, the selected model's default effort is used.
+Explicit reasoning settings win. If model routing is unavailable, policy keeps
+the current allowed model and compatible effort.
+
+## Shutdown
+
+Terminal interrupts retain native Codex behavior. Use `/exit` or `/quit` to leave
+the CLI. When the Codex child exits, the wrapper stops accepting proxy requests,
+closes active connections and cancels pending routing and upstream streams.
+Disconnecting a Codex request also cancels its upstream stream.
 
 ## Explanations and private state
 

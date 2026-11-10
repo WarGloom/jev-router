@@ -28,6 +28,24 @@ test("Codex launcher ignores project dotenv and loads the configured key file", 
   assert.equal(r.status, 0, r.stderr);
 });
 
+test("previous-exchange sharing defaults off and accepts explicit boolean consent", (t) => {
+  const f = fixture(t);
+  let r = f.run(`import assert from 'node:assert/strict'; import {loadEnv} from ${JSON.stringify(cliModule)}; assert.equal(loadEnv().sharePreviousExchange,false);`);
+  assert.equal(r.status, 0, r.stderr);
+  for (const enabled of [true, false]) {
+    writeFileSync(f.config, JSON.stringify({ api_key_file: f.key, share_previous_exchange: enabled }), { mode: 0o600 });
+    r = f.run(`import assert from 'node:assert/strict'; import {loadEnv} from ${JSON.stringify(cliModule)}; assert.equal(loadEnv().sharePreviousExchange,${enabled});`);
+    assert.equal(r.status, 0, r.stderr);
+  }
+});
+
+test("non-boolean previous-exchange consent is rejected", (t) => {
+  const f = fixture(t);
+  writeFileSync(f.config, JSON.stringify({ api_key_file: f.key, share_previous_exchange: "true" }), { mode: 0o600 });
+  const r = f.run(`import {loadEnv} from ${JSON.stringify(cliModule)}; loadEnv();`);
+  assert.notEqual(r.status, 0);
+});
+
 test("key files with shared permissions or symlink indirection are rejected", (t) => {
   const f = fixture(t);
   chmodSync(f.key, 0o644);
@@ -47,6 +65,27 @@ test("TypeSafe credentials are not inherited by the Codex child", (t) => {
   f.env.TYPESAFE_API_KEY = "synthetic-parent-key";
   f.env.TYPESAFE_BASE_URL = "http://attacker.invalid";
   const r = f.run(`import assert from 'node:assert/strict'; import {codexEnvironment} from ${JSON.stringify(configModule)}; const e=codexEnvironment('ephemeral-session'); assert.equal(e.JEV_API_KEY,undefined); assert.equal(e.TYPESAFE_API_KEY,undefined); assert.equal(e.TYPESAFE_BASE_URL,undefined); assert.equal(e.JEV_ROUTER_SESSION_TOKEN,'ephemeral-session');`);
+  assert.equal(r.status, 0, r.stderr);
+});
+
+test("Jev routing honors pre-aborted and in-flight lifecycle cancellation", (t) => {
+  const f = fixture(t);
+  const routerModule = new URL("../src/router.mjs", import.meta.url).href;
+  const sdkModule = import.meta.resolve("@typesafe-ai/sdk");
+  const r = f.run(`
+    import assert from 'node:assert/strict';
+    import {TypeSafeClient} from ${JSON.stringify(sdkModule)};
+    let calls=0;
+    TypeSafeClient.prototype.systemOne=async()=>{calls++;return {answers:{model:{choice:'gpt-6.1-sol',confidence:.9}}};};
+    const {askJev}=await import(${JSON.stringify(routerModule)});
+    const input={prompt:'synthetic task',current:'gpt-6.1-sol',contextTokens:1,models:[{id:'gpt-6.1-sol',tier:'opus'}]};
+    assert.equal(await askJev({...input,signal:AbortSignal.abort()}),null);
+    assert.equal(calls,0);
+    const controller=new AbortController();let propagated=false;
+    TypeSafeClient.prototype.systemOne=async(request,options)=>{controller.abort();propagated=options.signal.aborted;throw new Error('synthetic cancellation');};
+    assert.equal(await askJev({...input,signal:controller.signal}),null);
+    assert.equal(propagated,true);
+  `);
   assert.equal(r.status, 0, r.stderr);
 });
 
