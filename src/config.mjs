@@ -178,7 +178,7 @@ export const questionForModels = (models) => {
 /** Ask only about levels supported by the model already selected by policy. */
 export const questionForEffort = (model, effortOverride = null) => choice(
   {
-    question: `Which supported reasoning level should ${model.id} use for this task?`,
+    question: `Which supported reasoning level should ${model.id} use for this task? Treat the current effort as context, not a requirement. Use low only for direct or mechanical work; ordinary implementation usually needs medium, and uncertain diagnosis or nontrivial correctness reasoning needs high or more. Choose based on the actual task, not a fixed preference for low.`,
     capability: CODEX_CAPABILITIES[model.id] ?? { model: model.description ?? model.id, ...GUIDANCE[model.tier] },
   },
   Object.fromEntries((model.efforts ?? []).flatMap((level) => {

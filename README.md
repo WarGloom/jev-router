@@ -13,8 +13,8 @@ launcher.
 
 - Adds a Codex launcher and local proxy so routing uses the existing Codex CLI,
   authentication, sessions, tools, and permissions.
-- Routes model and reasoning effort separately, while honoring explicit client
-  and CLI effort settings, so automatic selection does not override user choices.
+- Routes model and reasoning effort separately, using the picker effort as context
+  while allowing Jev to choose the level appropriate to each task.
 - Preserves the selected model during tool loops and active-turn steering, and
   routes only user tasks, to avoid changing models mid-task or routing injected
   instructions and protocol traffic.
@@ -69,12 +69,9 @@ Leave `jev-router` selected in the native model picker for automatic routing.
 Jev first chooses a model using explicit capability criteria: Luna for simple
 self-contained or mechanical work, Terra for ordinary scoped engineering, and
 Sol for unknown-cause diagnosis, architecture, security, or concurrency. After
-policy resolves the final model, the router preserves the client's requested
-reasoning effort exactly. This includes native picker choices, saved Codex settings
-when the client serializes them in the request, and explicit child-agent request
-effort. The wrapper does not read Codex's saved configuration itself.
-A separate Jev Choice selects
-reasoning effort only when neither the request nor CLI supplies it. Supported levels
+policy resolves the final model, a separate Jev Choice selects its reasoning
+effort on each new user turn. The native picker effort is context for that choice,
+not a fixed level. Supported levels
 come from the Codex capability catalog:
 
 | Model | Supported efforts |
@@ -97,25 +94,16 @@ jev-codex exec "Fix the failing test"
 jev-codex -c 'model_reasoning_effort="high"'
 ```
 
-Effort precedence is the current request's `reasoning.effort`, then an explicit
-CLI effort setting, then automatic selection when both are absent. The requested
-effort restricts eligible models to those that support it exactly; the router
-never substitutes a weaker level. A native picker change takes effect on the
-next request, including during the same conversation. High controls reasoning
-depth; model routing remains a separate choice. Low favors fast responses with
-lighter reasoning; Medium balances speed and depth; High adds depth for complex
-problems. The additional `xhigh`, `max`, and `ultra` levels are available only
-where the selected model's catalog lists them. Effort is passed to the selected
-model; it does not guarantee subagent delegation.
+An explicit CLI effort setting restricts eligible models and pins the forwarded
+effort. Otherwise Jev can select a different effort from the native picker
+setting. Low is intended for direct or mechanical tasks, medium for ordinary
+implementation, and high or above for uncertain diagnosis and nontrivial
+correctness reasoning. Effort does not guarantee subagent delegation.
 
 Selecting a concrete allowed model manually pauses automatic model routing.
 Tool-loop continuations and steering messages received before a final assistant
-reply retain their model without calling Jev again. They retain their selected
-effort unless the current request explicitly changes it. An unsupported effort
-returns HTTP 400 with `unsupported_reasoning_effort`; a tool-loop request cannot
-silently change models to accommodate it. Child conversations keep separate
-routing state and honor their own inherited or explicit request effort. The
-router does not infer parent effort from child content.
+reply retain the selected model and effort without calling Jev again. Child
+conversations maintain separate routing state.
 If assistant phase metadata is absent, follow-ups conservatively keep the current
 selection. Routing resumes for user input after a final reply or in a new conversation.
 This guard detects active-turn steering; a final reply does not establish that the
@@ -148,7 +136,7 @@ Conversation length never vetoes a routing recommendation. At low confidence,
 a downgrade from a stronger model uses the balanced fallback without going below
 Jev's recommended tier; uncertain upgrades remain capped. If the effort Choice
 is unavailable or uncertain, the selected model's default effort is used.
-Per-request reasoning settings win over CLI defaults and cached decisions.
+An explicit CLI effort setting takes precedence over automatic selection.
 If model routing is unavailable, policy keeps
 the current allowed model and compatible effort.
 
